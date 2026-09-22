@@ -1,0 +1,437 @@
+# AGEM — Claude Build Prompts
+
+A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 · Architecture §29).
+
+**Every prompt names the exact documents and sections Claude must read before writing code.** The three source documents are:
+
+| Doc | Path | What it settles |
+|---|---|---|
+| FRS | `docs/FRS .md` | *What* to build — FR IDs, priorities, acceptance criteria, business rules |
+| Architecture | `docs/Architecture.md` | *How* to build it — layers, file paths, signatures, patterns, state machines |
+| PRD | `docs/PRD .md` | *Why* and *for whom* — product goal, user stories US-01…US-09, UX requirements |
+
+---
+
+## How to use these
+
+1. **Start every Claude Code session with the Session Opener below.** It loads the docs into context once.
+2. **Then paste one numbered prompt.** Do one prompt per session where possible — they're scoped to fit.
+3. **Do not skip ahead.** Each prompt assumes the previous ones are merged, exactly as the Roadmap sequences them.
+4. **If Claude proposes something not in the docs, stop it.** The docs are the contract; deviations belong in an ADR first.
+
+---
+
+## Session Opener (paste first, every session)
+
+> Before writing any code, read these three documents in full:
+> - `docs/FRS .md` — the functional requirements (FR IDs, priorities, acceptance criteria, business rules BR-01…BR-16)
+> - `docs/Architecture.md` — the architecture (5 layers, principles P1–P16, file organization §25, state machines §15, key interfaces §13.2)
+> - `docs/PRD .md` — the product requirements (goal, user stories US-01…US-09, UX requirements)
+>
+> These documents are the single source of truth for this project. Rules for everything you build in this session:
+> - Build **only** what the prompt asks for. Do not add features, abstractions, or "while I'm here" improvements.
+> - Every file you create must go at the exact path given in Architecture §25 Code Organization.
+> - Respect Architecture §3 Architectural Principles — especially P1 (one backend service), P3 (the database is the only source of truth), P4 (exactly one trust boundary), P8 (LLM judgement confined to one function), P11 (everything is bounded), P13 (errors normalised at one point), P14 (one responsibility per file).
+> - Respect FRS §5 Business Rules. BR-07 in particular: there is no public resume endpoint.
+> - If something the prompt asks for contradicts the docs, or the docs don't specify it, **stop and ask me** rather than inventing an answer.
+> - Do not write comments explaining what code does. Only comment a non-obvious constraint.
+>
+> Confirm you've read all three and list the FR IDs relevant to the prompt I'm about to give you. Then wait.
+
+---
+
+# Phase 1 — Foundations (Weeks 1–2)
+
+## Prompt 1 — Repository scaffold and Docker Compose
+
+> **Read first:** `docs/Architecture.md` §25 (Code Organization), §6 (Deployment), §8 (Container View), §30 (Tech Stack) · `docs/FRS .md` §3.14 (DEP), §2.2 (Operating environment)
+>
+> Create the AGEM monorepo skeleton exactly as laid out in Architecture §25. Create every directory and placeholder file in that tree — empty `__init__.py` files and stub modules are fine, but the structure must match the document exactly, including `sandbox_runner/`, `database/`, `scripts/` and `docs/`.
+>
+> Then write `docker-compose.yml` satisfying **FR-DEP-001**: it brings up frontend, backend, PostgreSQL and the sandbox image on one machine, per Architecture §8 Container View. Write `.env.example` with the variables named in Architecture §24 (Configuration): the static `API_KEY`, the LLM provider key, and the Fernet encryption key. Write `scripts/run_dev.sh` (**FR-DEP-007**) as the one command that starts everything.
+>
+> **Done when:** `docker-compose up` starts all four services and the directory tree matches Architecture §25 file for file.
+>
+> **Do NOT:** add Redis, Celery, Kubernetes, or a CI workflow yet — Architecture §30 marks Redis/Celery OPTIONAL and not before Week 8, and CI is Prompt 18.
+
+## Prompt 2 — Database schema and SQLAlchemy models
+
+> **Read first:** `docs/Architecture.md` §14 (Layer 5 — Data, including §14.1 entities, §14.2 conventions, §14.3 ERD), §15 (State Machines) · `docs/FRS .md` §3.12 (DAT, FR-DAT-001…008), §1.3 (Definitions)
+>
+> Write the SQLAlchemy models for all nine entities in Architecture §14.1 — `User`, `Agent`, `Capability`, `AgentCapability`, `Workflow`, `WorkflowAgent`, `Execution`, `ExecutionStep`, `Checkpoint` — in `backend/app/models/`, one file per model group as shown in Architecture §25.
+>
+> Apply every convention in Architecture §14.2 without exception: application-generated UUID primary keys (**FR-DAT-001**), `created_at`/`updated_at` in UTC on every table (**FR-DAT-002**), Python Enums for all status columns (**FR-DAT-003**), JSONB for workflow definition / step input / output / checkpoint state (**FR-DAT-004**), and the foreign key policies in **FR-DAT-005** — `ON DELETE RESTRICT` from Agent to WorkflowAgent, `ON DELETE CASCADE` down Execution → ExecutionStep → Checkpoint.
+>
+> Define every enum from Architecture §15 State Machines exactly as specified: `ExecutionStep.status` (5 values), `ExecutionStep.recovery_stage` (8 values), `Execution.status`, `Agent.status`, `Workflow.status`, `Capability.status`. Also write the `can_transition(old, new)` function enforcing the §15.1 transition rules.
+>
+> Set up Alembic and generate the first migration (**FR-DAT-006**).
+>
+> **Done when:** `alembic upgrade head` creates all nine tables with the stated constraints, and `can_transition` rejects every illegal transition in Architecture §15.1.
+>
+> **Do NOT:** build a generic repository abstraction — Architecture §14.4 explicitly calls for thin per-model CRUD functions only. Do NOT build a State-pattern class hierarchy — Architecture §11.5 explicitly rejects it.
+
+## Prompt 3 — FastAPI skeleton, error envelope, and API-key auth
+
+> **Read first:** `docs/Architecture.md` §10 (Layer 2 — API), §16 (API Architecture), §18.4 (Authentication), §24 (Configuration) · `docs/FRS .md` §3.10 (API, FR-API-001…006), §3.11 (AUTH, FR-AUTH-001, 002, 004)
+>
+> Build the FastAPI application skeleton in `backend/main.py` and the four empty routers in `backend/app/api/` named in Architecture §10.1: `agents.py`, `workflows.py`, `executions.py`, `capabilities.py`.
+>
+> Implement:
+> - **FR-API-003 / FR-API-004** — the single error envelope `{"error_code", "message", "details"}` as a global exception handler, plus the full error code catalogue in Architecture §10.2 (`VALIDATION_ERROR` 422, the four `*_NOT_FOUND` 404s, `WORKFLOW_CYCLE_DETECTED` 400, `UNAUTHORIZED` 401, `CAPABILITY_BUILD_FAILED` 500).
+> - **FR-AUTH-001** — one `get_api_key` dependency checking the `X-API-Key` header, applied globally to all routers.
+> - **FR-AUTH-004** — `backend/app/core/config.py` as the single entry point for all secrets, per Architecture §24.
+> - **FR-AUTH-002** — a seed function creating the single `User` row that owns everything.
+>
+> Configure Pydantic schemas in `backend/app/schemas/` with `extra = "forbid"` (**FR-API-002**).
+>
+> **Done when:** every route returns 401 with the standard envelope when `X-API-Key` is missing, and an invalid request body returns 422 in the same envelope shape.
+>
+> **Do NOT:** add OAuth, JWT, login, or RBAC — FRS **FR-AUTH-003** marks these explicitly deferred.
+
+---
+
+# Phase 2 — Agents, Adapters, Diagnosis (Week 3)
+
+## Prompt 4 — Adapter contract and REST adapter
+
+> **Read first:** `docs/Architecture.md` §25 (`adapters/`), §3 (P5, P6 — agents are external and opaque; framework knowledge lives only in adapters) · `docs/FRS .md` §3.2 (ADP, FR-ADP-001…008), §5 (BR-12, BR-13) · `docs/PRD .md` (US-03)
+>
+> Write `backend/adapters/base_adapter.py` — an abstract base class defining exactly one method, `execute(input: dict) -> dict` (**FR-ADP-001**). This is the contract every agent reaches AGEM through; it is not optional and not simplifiable.
+>
+> Write `backend/adapters/rest_adapter.py` (**FR-ADP-002**) calling an external agent over HTTP through that contract, exposing the common I/O shape in **FR-ADP-004**: task input, context, requested capability/tool info, result, status, error.
+>
+> **Done when:** a REST agent can be called through `execute()` and returns the common shape; no framework-specific import exists outside `adapters/` (**FR-ADP-006**).
+>
+> **Do NOT:** import any agent's code into the AGEM process (**FR-ADP-007**, Architecture P5). Do NOT write the LangChain or CrewAI adapter yet — that's Week 7, Prompt 12.
+
+## Prompt 5 — Agent registration API and registry
+
+> **Read first:** `docs/Architecture.md` §10.3 (Endpoint groups), §14.1 (Agent, AgentCapability entities), §15.4 (Agent.status), §18.5 (Data protection) · `docs/FRS .md` §3.1 (AGT, FR-AGT-001…010) · `docs/PRD .md` (US-01)
+>
+> Implement the four agent endpoints from Architecture §10.3 in `backend/app/api/agents.py`:
+> - `POST /api/agents` (**FR-AGT-001**) — returns the created Agent with status `ACTIVE`
+> - `GET /api/agents` (**FR-AGT-004**), `GET /api/agents/{id}` (**FR-AGT-005**, 404 `AGENT_NOT_FOUND`)
+> - `DELETE /api/agents/{id}` (**FR-AGT-006**) — returns **409** when the agent is referenced by an active workflow, enforced by the `ON DELETE RESTRICT` constraint from Prompt 2, not by application logic alone
+>
+> Enforce **FR-AGT-002**: `framework` must be one of `python`, `rest`, `langchain`, `crewai` — rejected at registration, not at execution time. Enforce the **FR-AGT-003** status rules from Architecture §15.4. Implement **FR-AGT-007**: Fernet-encrypted `encrypted_credentials`, never echoed in any API response (Architecture §18.5).
+>
+> Write `scripts/seed_agents.py` (**FR-AGT-010**) populating 4–5 test agents.
+>
+> **Done when:** US-01 passes — an agent registers and appears `ACTIVE` with no change to the agent's own source code, and deleting an in-use agent returns 409.
+>
+> **Do NOT:** accept agent source-code upload (**FR-AGT-008** — endpoint/connection info only).
+
+## Prompt 6 — Master Agent: LLM failure diagnosis
+
+> **Read first:** `docs/Architecture.md` §11.4 (LLM usage inside Orchestration), §12 (AI Safety / Guardrails), §3 (P8, P15), §31 (ADR-001) · `docs/FRS .md` §3.6 (DIAG, FR-DIAG-001…011), §4 (NFR-PERF-03) · `docs/PRD .md` (US-07)
+>
+> Write `backend/orchestrator/master_agent.py` implementing `diagnose_failure(step_id: UUID, error: dict) -> Literal["NORMAL_ERROR", "CAPABILITY_GAP"]` (**FR-DIAG-003**) — exactly two outcomes, no third.
+>
+> First write the single LLM wrapper (**FR-DIAG-009**, Architecture P15) that every LLM call in this codebase goes through. It must: request JSON constrained to a fixed Pydantic schema (**FR-DIAG-005**); on parse/validation failure retry the same call up to 2 times with the validation error appended to the prompt (**FR-DIAG-006**); then fail safe to `NORMAL_ERROR` rather than hang (**FR-DIAG-007**). Enforce the 20-second timeout from Architecture §4 / NFR-PERF-03, and the cheaper model tier for diagnosis per **FR-DIAG-008** and Architecture §22.
+>
+> Budget: exactly one diagnosis call per failure (**FR-DIAG-004**, Architecture P11).
+>
+> **Done when:** given the normalised error shape from FRS **FR-DIAG-002**, the function returns one of the two literals, and a forced schema-validation failure three times over still returns `NORMAL_ERROR` instead of raising.
+>
+> **Do NOT:** let any other module call the LLM API directly (**FR-DIAG-009**). Do NOT make this a separate service — ADR-001 fixes it as a method inside the Orchestrator service.
+
+---
+
+# Phase 3 — Workflows and Orchestration (Weeks 4–5)
+
+## Prompt 7 — Workflow creation with DAG validation
+
+> **Read first:** `docs/Architecture.md` §10.3, §14.1 (Workflow, WorkflowAgent), §15.5 (Workflow.status), §3 (P10 — the DAG is validated at creation, not at execution) · `docs/FRS .md` §3.3 (WFL, FR-WFL-001…009), §5 (BR-06) · `docs/PRD .md` (US-02)
+>
+> Implement the workflow endpoints in `backend/app/api/workflows.py`: `POST /api/workflows` (**FR-WFL-001**), `GET /api/workflows` and `GET /api/workflows/{id}` (**FR-WFL-007**) — the detail response returns the DAG structure React Flow consumes directly.
+>
+> Validation at creation time only:
+> - **FR-WFL-002** — a topological sort; reject with `400 WORKFLOW_CYCLE_DETECTED` if the dependencies aren't a valid DAG
+> - **FR-WFL-003** — reject a step referencing an unknown `agent_id` at creation, not at run time
+> - **FR-WFL-004** — the topological sort runs **once**, and the result is stored on `WorkflowAgent.step_order`; the Orchestrator must never re-sort at run time
+> - **FR-WFL-005** — `WorkflowAgent.input_mapping` declares which upstream output field feeds this step
+> - **FR-WFL-006** — `DRAFT → ACTIVE → ARCHIVED` per Architecture §15.5; `ACTIVE` only after validation passes
+>
+> Support 1–5 agents per workflow (**FR-WFL-009**).
+>
+> **Done when:** US-02 passes — a cyclic definition is rejected before saving, and a valid workflow stores a fixed `step_order`.
+
+## Prompt 8 — Orchestrator: sequential DAG execution
+
+> **Read first:** `docs/Architecture.md` §11 (Layer 3 — Orchestration, especially §11.2 scheduler algorithm), §15.1 and §15.3 (state machines), §3 (P2, P3, P13, P14) · `docs/FRS .md` §3.4 (ORC, FR-ORC-001…014), §5 (BR-13) · `docs/PRD .md` (US-04)
+>
+> Write `backend/orchestrator/orchestrator.py` and `backend/orchestrator/step_executor.py`, following Architecture §11.2's scheduler algorithm and §11.1's one-responsibility-per-file split.
+>
+> - **FR-ORC-001** — `POST /api/workflows/{id}/executions` returns `execution_id` immediately; the run proceeds via FastAPI `BackgroundTasks`. The API layer never blocks (Architecture P2).
+> - **FR-ORC-002** — `Orchestrator.run_execution(execution_id: UUID) -> None`
+> - **FR-ORC-003 / FR-ORC-004** — steps run in the stored `step_order`; sibling steps with no dependency between them run under `asyncio.gather`
+> - **FR-ORC-005** — step N's input includes the declared upstream output field(s) (US-04: no manual wiring)
+> - **FR-ORC-012** — `StepExecutor.run_step(step_id: UUID) -> dict`
+> - **FR-ORC-008 / FR-ORC-009** — the 5-state machine, enforced through the `can_transition` function from Prompt 2
+> - **FR-ORC-010** — `Execution.status` rolls up per Architecture §15.3
+> - **FR-ORC-013** — status and checkpoint written in the same SQLAlchemy transaction
+>
+> Implement **FR-ORC-011**'s `recovery_stage` field now (values per Architecture §15.2) even though nothing sets it beyond `NONE` yet.
+>
+> Critically, implement **FR-ADP-005 / FR-DIAG-002 / BR-13** inside `step_executor.py`: every exception and every structured agent error is normalised to `{"status": "FAILED", "error_type": "...", "raw_error": "..."}` before anything downstream sees it.
+>
+> **Done when:** a 2-agent workflow runs end to end in declared order, and orchestration bookkeeping stays under the 300 ms/step budget in **FR-ORC-014**.
+>
+> **Do NOT:** add failure handling, diagnosis, or recovery yet — Roadmap Week 4 is explicitly "no failure yet". That's Prompt 11.
+
+## Prompt 9 — Checkpoint manager: pause and resume
+
+> **Read first:** `docs/Architecture.md` §11.3 (Checkpoint contents), §14.1 (Checkpoint entity), §20.1 (Reliability), §31 (ADR-002) · `docs/FRS .md` §3.5 (CKP, FR-CKP-001…009), §5 (BR-01, BR-07) · `docs/PRD .md` (US-06)
+>
+> Write `backend/orchestrator/checkpoint_manager.py` implementing `CheckpointManager.save(step_id: UUID, state: dict) -> None` and `CheckpointManager.load(execution_id: UUID) -> dict` (**FR-CKP-001**).
+>
+> - **FR-CKP-002** — the checkpoint is written **twice per step**: when a step succeeds, and again the moment a step pauses. Never only at the end of a run.
+> - **FR-CKP-003** — contents exactly as Architecture §11.3 specifies: current step, prior successful outputs, pending inputs, workflow state, recovery information — stored as JSONB
+> - **FR-CKP-004** — only the failed `ExecutionStep` enters `PAUSED`; upstream steps are untouched
+> - **FR-CKP-005** — resume reads its input from the checkpoint; upstream steps are **never** recomputed
+> - **FR-CKP-006** — resuming an already-`SUCCEEDED` step is a no-op
+> - **FR-CKP-008** — after 3 failed attempts a `PAUSED` step moves to `FAILED`
+>
+> **Done when:** US-06 passes — a workflow pauses at a failed step and resumes from the checkpoint without re-running any upstream step.
+>
+> **Do NOT:** expose a public resume endpoint. **FR-CKP-007 / BR-07 / Architecture P9** forbid it — resume is only ever an internal consequence of a successful diagnosis or a verified capability.
+
+---
+
+# Phase 4 — Capability Engine and Sandbox (Weeks 4–8)
+
+## Prompt 10 — Searcher: free-tool check
+
+> **Read first:** `docs/Architecture.md` §13.1 (pipeline), §13.2 (key interfaces), §13.5 (real vs simplified), §31 (ADR-003) · `docs/FRS .md` §3.7 (CAP, FR-CAP-002, 003, 004), §5 (BR-03)
+>
+> Write `backend/capability_engine/searcher.py` implementing `Searcher.find_free_tool(capability_name: str) -> Tool | None` exactly as signed in Architecture §13.2.
+>
+> Per **FR-CAP-003** and Architecture §13.5, this is deliberately a **hardcoded web-search check, not a general tool-discovery system**. Build it as the simplified version the docs specify and name it as such in the module docstring — do not over-build it into real discovery.
+>
+> This stage always runs **before** the build path (**FR-CAP-002**, ADR-003, BR-03).
+>
+> **Done when:** a capability name with a known free tool returns a `Tool`; anything else returns `None`.
+
+## Prompt 11 — Wire orchestrator to master_agent on failure
+
+> **Read first:** `docs/Architecture.md` §11.2 (scheduler algorithm failure branch), §17.2 (end-to-end control flow steps 10–14), §23 (Error Handling Model) · `docs/FRS .md` §3.4 (FR-ORC-007), §3.6 (FR-DIAG-010), §3.5 (FR-CKP-004) · `docs/PRD .md` (US-05, US-07)
+>
+> Connect the pieces built so far: when `step_executor.run_step()` returns the normalised `FAILED` shape, the Orchestrator must follow Architecture §11.2's failure branch exactly — write the paused checkpoint, mark the step `PAUSED`, set `recovery_stage = DIAGNOSING`, call `diagnose_failure()`, then route per Architecture §23.2:
+> - `NORMAL_ERROR` → retry or stop the step, then continue (**FR-ORC-007**)
+> - `CAPABILITY_GAP` → hand off to the Capability Engine (stubbed for now — the real handoff arrives in Prompt 14)
+>
+> Surface the diagnosis result on the step detail response (**FR-DIAG-010**) so it's visible without reading logs.
+>
+> **Done when:** a deliberately failing step pauses, gets classified, and a `NORMAL_ERROR` retries without re-running any upstream step.
+
+## Prompt 12 — Sandbox runner: the isolated Docker image
+
+> **Read first:** `docs/Architecture.md` §13.4 (Sandbox invocation — fixed), §12 (AI Safety / Guardrails), §18 (Security), §3 (P4 — exactly one trust boundary), §31 (ADR-004) · `docs/FRS .md` §3.8 (SBX, FR-SBX-001…012), §4 (NFR-SEC-01, 02, 03)
+>
+> This is the non-negotiable safety component (ADR-004). Nothing here may be simplified.
+>
+> Build `sandbox_runner/` — its own minimal `Dockerfile`, `runner.py`, and a `requirements.txt` limited to stdlib plus very few packages (**FR-SBX-001**). It is *not* a module inside the backend.
+>
+> Then write `backend/capability_engine/sandbox.py` implementing `Sandbox.run(code: str, inputs: list[dict]) -> SandboxResult` (Architecture §13.2), invoking the container exactly as Architecture §13.4 fixes it:
+> - fresh container per run, destroyed afterwards (**FR-SBX-002**)
+> - `--network none` (**FR-SBX-003**)
+> - hard 10-second timeout (**FR-SBX-004**)
+> - `--memory=256m --cpus=0.5` (**FR-SBX-005**)
+> - code and inputs passed in by file mount (**FR-SBX-006**)
+> - filesystem access limited to a scratch directory (**FR-SBX-008**)
+>
+> Write `backend/tests/test_sandbox.py` now, covering all four cases in **FR-SBX-012**: a network attempt fails; a timeout is killed; a memory-cap breach is killed; a benign function returns correctly.
+>
+> **Done when:** all four `test_sandbox.py` cases pass. This is the test suite an examiner will probe.
+>
+> **Do NOT:** relax any flag for convenience. The degraded subprocess fallback in **FR-SBX-011** is only for when Docker is unavailable — isolation is never skipped.
+
+## Prompt 13 — Builder: LLM code generation with static import check
+
+> **Read first:** `docs/Architecture.md` §13.2, §12 (AI Safety — import allowlist, two-layer defence), §22 (Cost — stronger model for generation) · `docs/FRS .md` §3.7 (FR-CAP-005, 006), §3.8 (FR-SBX-007, 009)
+>
+> Write `backend/capability_engine/builder.py` implementing `Builder.build(capability_name: str, spec: dict) -> str` — it returns Python source and **never executes it** (**FR-CAP-005**). That separation is the whole safety story.
+>
+> Use the single LLM wrapper from Prompt 6, with the stronger model tier per Architecture §22.
+>
+> Then implement the static import check (**FR-CAP-006**, Architecture §12): generated code is scanned for disallowed imports — `os.system`, `subprocess`, `socket`, `open` outside a scratch directory — **before** it is ever sent to the sandbox. Per **FR-SBX-009** this is the first of two layers; the container restrictions from Prompt 12 are the second. Neither replaces the other.
+>
+> **Done when:** generated source for a simple calculator capability is returned as a string, and code containing `import subprocess` is rejected by the static check before reaching the sandbox.
+
+## Prompt 14 — Tester, Verifier, Registry, and the full engine pipeline
+
+> **Read first:** `docs/Architecture.md` §13 in full (§13.1 pipeline diagram, §13.2 signatures, §13.3 design patterns, §13.5 real vs simplified), §15.6 (Capability.status), §31 (ADR-006) · `docs/FRS .md` §3.7 (FR-CAP-001, 007…017), §5 (BR-08, BR-09, BR-10) · `docs/PRD .md` (US-08)
+>
+> Complete the Capability Engine:
+> - `tester.py` — `Tester.test(code, samples) -> TestResult`, run against **3 sample inputs** (**FR-CAP-008**)
+> - `verifier.py` — `Verifier.verify(result, expected_type, expected_range) -> float` returning the `verification_score` (**FR-CAP-009**). Per **FR-CAP-010** and Architecture §13.5 this is an output type/range check, **not** formal verification — build the simplified version the docs specify
+> - `registry.py` — `Registry.register(name, version, code, score) -> Capability` (**FR-CAP-013**), with the `BUILDING / VERIFIED / FAILED` lifecycle from Architecture §15.6. Only `VERIFIED` rows are ever handed to an agent; `FAILED` rows are **kept**, never deleted (**FR-CAP-014**, BR-10)
+> - `engine.py` — `CapabilityEngine.resolve_gap(capability_name, context) -> Capability | None`, running the stages in the order shown in Architecture §13.1
+>
+> Per **FR-CAP-001** and Architecture §13.3, implement the pipeline as a **simple ordered list of functions** (Chain of Responsibility), explicitly *not* a class-per-handler OOP hierarchy.
+>
+> Enforce the bounds: 3 build/repair attempts per gap, then return `None` and mark the step `FAILED` with `CAPABILITY_BUILD_FAILED` (**FR-CAP-012**, BR-09, Architecture P11). Keep the whole loop under the 60-second budget in **FR-CAP-017**.
+>
+> Then wire the real handoff from Prompt 11's stub, and implement **FR-CAP-015** (grant via `AgentCapability` row, resume the exact paused step) and **FR-CAP-016** (a second agent hitting the same gap finds it in the registry instead of rebuilding — ADR-006).
+>
+> Update `recovery_stage` through every stage as the step progresses (**FR-ORC-011**) — the dashboard depends on it.
+>
+> **Done when:** US-08 passes end to end — a capability gap is detected, built, sandboxed, tested, verified, registered, granted, and the exact paused step resumes and succeeds with zero manual code deployment.
+
+## Prompt 15 — Framework adapter (LangChain or CrewAI)
+
+> **Read first:** `docs/Architecture.md` §25 (`adapters/`), §3 (P6) · `docs/FRS .md` §3.2 (FR-ADP-003, 006), §11 (OI-01) · `docs/PRD .md` (US-03)
+>
+> Write **one** of `backend/adapters/langchain_adapter.py` or `backend/adapters/crewai_adapter.py` (**FR-ADP-003**) — one of the two, not both. FRS §11 OI-01 leaves the choice open; pick the one we're more comfortable with and note the choice in the module docstring.
+>
+> It implements the same `base_adapter.py` contract from Prompt 4, nothing more.
+>
+> **Done when:** the Orchestrator calls a framework agent through the identical `execute(input) -> output` interface it uses for REST agents, and **FR-ADP-006** still holds — no framework-specific import has leaked outside `adapters/`, and nothing in `orchestrator/` changed to accommodate this adapter.
+
+---
+
+# Phase 5 — Frontend (Weeks 9–10)
+
+## Prompt 16 — React shell, Dashboard, Agents, Workflows pages
+
+> **Read first:** `docs/Architecture.md` §9 (Layer 1 — Presentation, especially §9.2 the form-based decision), §25 (frontend tree), §15 (enums to mirror) · `docs/FRS .md` §3.9 (UI, FR-UI-001…005, 010, 011, 012) · `docs/PRD .md` (UX Requirements, US-01, US-02, US-09)
+>
+> Build the React + TypeScript + Tailwind frontend shell per Architecture §9.1 and the file tree in §25.
+>
+> - **FR-UI-001** — persistent left sidebar with exactly five items: Dashboard, Agents, Workflows, Executions, Capabilities. No deeper hierarchy.
+> - **FR-UI-002** — Dashboard summary cards: active agents, saved workflows, running executions, recent capability builds
+> - **FR-UI-003** — Agents page: table plus the Register Agent form
+> - **FR-UI-004** — Workflows page with the **form-based** creator. Read Architecture §9.2 carefully: React Flow **visualizes** the DAG read-only; it does **not** author it. Do not build a drag-and-drop graph editor.
+> - **FR-UI-010** — loading skeleton, empty state with CTA, error toast, inline cycle-validation error
+> - **FR-UI-011** — the accessibility baseline in Architecture §9.4: semantic HTML, visible focus states, labelled inputs, status badges pairing colour with a text label or icon
+> - **FR-UI-012** — mirror every backend enum into `frontend/src/types/`; never hardcode a status string in a component
+>
+> **Done when:** agents can be registered and workflows created from the UI, and the DAG renders read-only for confirmation before saving.
+
+## Prompt 17 — Executions monitor and Capabilities page
+
+> **Read first:** `docs/Architecture.md` §9.3 (page states), §15.2 (recovery_stage), §10.3 (`GET /api/executions/{id}`), §21 (Observability — the Executions page *is* the observability tool) · `docs/FRS .md` §3.9 (FR-UI-005…009), §4 (NFR-PERF-02) · `docs/PRD .md` (US-05, US-09)
+>
+> Build the two pages that carry the demo:
+> - **FR-UI-006** — Execution detail: `WorkflowGraph.tsx` (React Flow, read-only) with each node colour-coded via `StepStatusCard.tsx`, plus a live timeline/log underneath
+> - **FR-UI-007** — refresh by polling `GET /api/executions/{id}` every 3 seconds (NFR-PERF-02). WebSockets are deliberately rejected for MVP
+> - **FR-UI-008** — **the money shot**: a distinct node state rendering `recovery_stage` (searching / building / sandboxing / testing / verifying) so a viewer watches recovery *happening*, not just failure→success
+> - **FR-UI-009** — Capabilities page: read-only registry showing name, version, `verification_score`, source (built vs acquired). No manual creation UI — capabilities are created only by the engine
+>
+> **Done when:** US-05 and US-09 pass — a step's status change appears within one 3-second polling interval, and a capability gap visibly walks through its recovery stages on screen.
+
+---
+
+# Phase 6 — Demo, Tests, Hardening (Weeks 10–12)
+
+## Prompt 18 — Demo trigger script
+
+> **Read first:** `docs/Architecture.md` §28 (User Flow — demo flow and illustrative scenarios), §17.1 (the sequence diagram this reproduces) · `docs/FRS .md` §3.7 (FR-CAP-019), §3.14 (FR-DEP-007), §7 (UC-10)
+>
+> Write `scripts/trigger_capability_gap.py` (**FR-CAP-019**) — it reproducibly forces a capability gap so the full search → build → sandbox → test → verify → resume sequence runs on demand during a live demo.
+>
+> Use the calculator gap from Architecture §28.2's end-to-end example. The script must be reliable enough to run in front of an examiner: same result every time, no dependence on a flaky external call.
+>
+> **Done when:** running the script reproduces Architecture §17.1's sequence diagram end to end, visible live on the Executions page from Prompt 17.
+
+## Prompt 19 — Test suite and CI
+
+> **Read first:** `docs/Architecture.md` §26 (Testing Architecture) · `docs/FRS .md` §8 (Testing, all of it), §3.14 (FR-DEP-003…006)
+>
+> Write the remaining three test files per FRS §8.2, with exactly the cases listed there:
+> - `test_adapters.py` (**FR-ADP-008**) — valid REST response; timeout; malformed JSON normalised into the standard error shape
+> - `test_orchestrator.py` — 2-step workflow runs in declared order; cyclic definition rejected with `WORKFLOW_CYCLE_DETECTED`; a failed step pauses without re-running upstream steps; a resumed step reads input from the checkpoint
+> - `test_capability_engine.py` — a gap with a free tool skips the build path entirely; a gap without one builds/tests/verifies/registers; a capability failing verification three times marks the step `FAILED` instead of looping
+>
+> Mock all LLM calls in unit tests (**FR-DEP-006**). Hit the 70% coverage target on `orchestrator/`, `adapters/`, `capability_engine/` (**FR-DEP-005**) — API layer and models are deliberately excluded.
+>
+> Then write `.github/workflows/ci.yml` (**FR-DEP-003**) with exactly two jobs per Architecture §26: backend (install, ruff/flake8, pytest) and frontend (`npm ci`, `tsc --noEmit`, `npm run build`). No deploy job.
+>
+> **Done when:** CI is green on both jobs and coverage meets the target.
+
+## Prompt 20 — LLM evaluation sets
+
+> **Read first:** `docs/Architecture.md` §26 (LLM output evaluation rows) · `docs/FRS .md` §8.3, §3.6 (FR-DIAG-011), §3.7 (FR-CAP-018)
+>
+> Build the two evaluation sets that stop prompt edits from silently regressing behaviour:
+> - **FR-DIAG-011** — 20 hand-labelled error examples (10 genuine capability gaps, 10 normal errors) in `backend/tests/fixtures/`, scored as classification accuracy with an **18/20 pass bar**, re-run whenever the diagnosis prompt changes
+> - **FR-CAP-018** — 5 canned gaps (the demo calculator plus four others), scored as the proportion reaching `VERIFIED` within the 3-attempt cap
+>
+> These are the only two places real API calls happen (**FR-DEP-006**) — keep them out of the default CI run.
+>
+> **Done when:** both evaluations run on demand and report a score against the stated bar.
+
+## Prompt 21 — Security review pass
+
+> **Read first:** `docs/Architecture.md` §18 (Security Architecture in full), §12 (AI Safety / Guardrails), §3 (P4, P16) · `docs/FRS .md` §3.11 (FR-AUTH-007), §3.8 (SBX), §4 (NFR-SEC-01…05)
+>
+> Conduct the Week 11 security review (**FR-AUTH-007**) across three areas, and report findings rather than silently changing things:
+> 1. **Sandbox limits** — verify every flag in Architecture §13.4 is actually applied at runtime, not just configured. Confirm the two-layer defence (**FR-SBX-009**) holds: static import check *and* container restrictions.
+> 2. **Input validation** — confirm `extra = "forbid"` is on every schema (**FR-API-002**), and that DAG validation cannot be bypassed (**BR-06**).
+> 3. **Auth and secrets** — confirm `X-API-Key` is enforced globally (**FR-AUTH-001**), that secrets are read only through `core/config.py` (**FR-AUTH-004**, Architecture P16), that agent credentials are Fernet-encrypted and never echoed (**FR-AUTH-005**), and that logs carry metadata only, never raw payloads (**FR-AUTH-006**).
+>
+> Also verify **NFR-SEC-01**: no path exists by which untrusted code executes in the FastAPI backend process.
+>
+> **Done when:** each of the three areas has a written pass/fail finding with the FR ID it was checked against.
+
+## Prompt 22 — Observability and structured logging
+
+> **Read first:** `docs/Architecture.md` §21 (Observability), §12 (audit logging as a safety requirement) · `docs/FRS .md` §3.13 (OBS, FR-OBS-001…005)
+>
+> Implement structured JSON logging via Python's standard `logging` module, written to stdout and captured by Docker (**FR-OBS-001**).
+>
+> Every log line carries `execution_id`, `step_id` and `agent_id` where applicable (**FR-OBS-002**) — this is the debugging tool and the audit trail at the same time.
+>
+> Per **FR-OBS-003 / FR-OBS-004** and Architecture §12, every LLM call and every sandbox execution logs prompt, response and verdict. This is treated as a **safety** requirement, not just debugging: it's the only way to explain after the fact why a generated tool was trusted.
+>
+> **Do NOT:** add ELK, Datadog, Grafana or OpenTelemetry — **FR-OBS-006** marks these deliberately out.
+
+---
+
+# Optional — LYK prompts (only if ahead of schedule)
+
+These map to the LYK requirements already written into the FRS. Each is self-contained and additive — none can break the core loop.
+
+## Prompt L1 — Diagnosis reason string
+> **Read first:** `docs/FRS .md` §3.6 (**FR-DIAG-012**) · `docs/Architecture.md` §11.4
+>
+> Extend `diagnose_failure()` so the same schema-validated call also returns `reason` and, where applicable, `missing_capability`. Render `reason` in the step detail view alongside the classification. Zero extra LLM calls, zero extra cost — it must reuse the existing single call.
+
+## Prompt L2 — Generated code viewer
+> **Read first:** `docs/FRS .md` §3.7 (**FR-CAP-020**), §3.9 (**FR-UI-013**) · `docs/Architecture.md` §13.2 (`Registry.register` already stores the source)
+>
+> Add a read-only capability detail view showing the stored generated source, the verification score, the 3 test inputs, and pass/fail per input. All of this data is already stored — this is a read path only.
+
+## Prompt L3 — Agent connection test
+> **Read first:** `docs/FRS .md` §3.1 (**FR-AGT-011**)
+>
+> Ping the agent's endpoint once at registration; only set status `ACTIVE` if it responds. A mistyped endpoint must fail at registration, not mid-demo.
+
+## Prompt L4 — Token and cost counter
+> **Read first:** `docs/FRS .md` §3.13 (**FR-OBS-007**) · `docs/Architecture.md` §22 (Cost Architecture)
+>
+> Log prompt/completion tokens on every LLM call, roll them up onto the `Execution` row, and surface one cost figure on the execution detail page. This turns Architecture §22 from asserted into demonstrated.
+
+## Prompt L5 — Failed-attempt history
+> **Read first:** `docs/FRS .md` §3.7 (**FR-CAP-021**), §5 (BR-10)
+>
+> Store all 3 build attempts per gap (code + failure reason), not just the final state, and show them in the capability detail view.
+
+## Prompt L6 — Execution report export
+> **Read first:** `docs/FRS .md` §3.10 (**FR-API-007**)
+>
+> Add `GET /api/executions/{id}/report` returning a JSON or Markdown summary: steps, statuses, diagnosis, capability built, verification score, timings.
+
+---
+
+## Prompt 23 — Final documentation and demo rehearsal (Week 12)
+
+> **Read first:** all three documents · `docs/Architecture.md` §28 (User Flow), §31 (ADRs) · `docs/FRS .md` §7 (Use Cases), §8.6 (User acceptance checklist)
+>
+> Write the root `README.md` covering the problem, the solution, key features, the architecture summary, the tech stack, and the scope disclaimer — sourced from the master documentation's README Summary section, not invented.
+>
+> Write `docs/demo-script.md` following the demo flow in Architecture §28.1 and the evidence list in §28.3.
+>
+> Then walk FRS §8.6's 10-item user acceptance checklist and record pass/fail for each.
+>
+> **Done when:** every Must-priority item on the checklist passes, and the demo script runs start to finish without manual intervention beyond the documented steps.
