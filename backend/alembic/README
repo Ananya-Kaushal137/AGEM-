@@ -1,0 +1,2 @@
+Alembic migrations. Initialised in Prompt 2 (FR-DAT-006):
+`alembic init` writes env.py / script.py.mako here and alembic.ini at backend/.

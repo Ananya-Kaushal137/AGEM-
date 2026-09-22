@@ -1,0 +1,86 @@
+# AGEM — single machine, single node, self-hosted (Architecture §6).
+# Four services, matching the Container View in Architecture §8: frontend,
+# backend, PostgreSQL and the sandbox image (FR-DEP-001).
+#
+# Deliberately absent: Redis, Celery, Kubernetes. Architecture §30 marks
+# Redis/Celery OPTIONAL and not before Week 8.
+
+name: agem
+
+services:
+  # 1. PRESENTATION — React SPA, polls the API every 3 s, holds no state.
+  frontend:
+    build: ./frontend
+    container_name: agem-frontend
+    ports:
+      - "${FRONTEND_PORT:-5173}:5173"
+    environment:
+      VITE_API_URL: http://localhost:${BACKEND_PORT:-8000}
+      VITE_API_KEY: ${API_KEY}
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/index.html:/app/index.html
+    depends_on:
+      - backend
+
+  # 2-4. API + ORCHESTRATION + CAPABILITY ENGINE — one Python process
+  # (Architecture §8: separation is by module boundary, not network boundary).
+  backend:
+    build: ./backend
+    container_name: agem-backend
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-agem}:${POSTGRES_PASSWORD:-agem}@postgres:5432/${POSTGRES_DB:-agem}
+      API_KEY: ${API_KEY}
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      LLM_API_KEY: ${LLM_API_KEY}
+      FERNET_KEY: ${FERNET_KEY}
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-agem-sandbox-runner:latest}
+    volumes:
+      - ./backend:/app
+      # The Capability Engine starts a fresh sandbox container per run
+      # (Architecture §13.4), so it needs the host Docker daemon.
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      sandbox:
+        condition: service_started
+
+  # 5. DATA — the single source of truth for agents, workflows, executions,
+  # checkpoints and the capability registry (Architecture §7).
+  postgres:
+    image: postgres:16-alpine
+    container_name: agem-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-agem}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agem}
+      POSTGRES_DB: ${POSTGRES_DB:-agem}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agem} -d ${POSTGRES_DB:-agem}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # SANDBOX — the separate minimal image. Compose builds and tags it; the
+  # Capability Engine then runs a *fresh* container from this image per
+  # execution and destroys it afterwards (Architecture §13.4), so this
+  # long-lived container exists only to guarantee the image is present.
+  sandbox:
+    build: ./sandbox_runner
+    image: ${SANDBOX_IMAGE:-agem-sandbox-runner:latest}
+    container_name: agem-sandbox
+    entrypoint: ["sleep", "infinity"]
+    network_mode: "none"
+    mem_limit: 256m
+    cpus: 0.5
+    restart: "no"
+
+volumes:
+  postgres_data:

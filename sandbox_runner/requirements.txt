@@ -1,0 +1,3 @@
+# Deliberately empty: stdlib only.
+# Nothing is added here without a safety review — this image runs untrusted code
+# (Architecture §25.1, §13.4).
