@@ -3,6 +3,7 @@ uvicorn[standard]
 sqlalchemy
 psycopg2-binary
 alembic
+tzdata  # alembic.ini sets timezone = UTC; zoneinfo needs this on Windows
 pydantic
 pydantic-settings
 python-dotenv
