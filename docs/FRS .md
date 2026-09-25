@@ -105,8 +105,8 @@ Each requirement has an ID, priority and acceptance criteria (AC). Sections are 
 
 | ID | Requirement | Pri | Acceptance criteria |
 |---|---|---|---|
-| FR-AGT-001 | Register an agent | M | `POST /api/agents` with name, framework, endpoint/config returns the created Agent with status `ACTIVE` |
-| FR-AGT-002 | Framework enum validation | M | `framework` must be one of `python`, `rest`, `langchain`, `crewai`; anything else is rejected at registration with a clear error, not later at execution time |
+| FR-AGT-001 | Register an agent | M | `POST /api/agents` with name, framework, endpoint/config returns the created Agent with status `ACTIVE`. Agents are registered by HTTP endpoint only (ADR-009) |
+| FR-AGT-002 | Framework enum validation | M | `framework` must be one of `rest`, `langchain` or `crewai` (whichever framework adapter is built, FR-ADP-003), plus `mcp` only if FR-ADP-009 is built; anything else is rejected at registration with a clear error, not later at execution time. A plain Python agent registers as `rest` behind `python_wrapper.py` (FR-ADP-011) |
 | FR-AGT-003 | Agent status lifecycle | M | `ACTIVE` / `INACTIVE`; an `INACTIVE` agent cannot be added to a new workflow, but executions already referencing it still resolve |
 | FR-AGT-004 | List agents | M | `GET /api/agents` backs the Agents page table |
 | FR-AGT-005 | Agent detail | M | `GET /api/agents/{id}`; `404 AGENT_NOT_FOUND` if missing |
@@ -115,7 +115,7 @@ Each requirement has an ID, priority and acceptance criteria (AC). Sections are 
 | FR-AGT-008 | No code upload | M (scope boundary) | Registration accepts endpoint/connection info only; no agent source-code upload in the MVP |
 | FR-AGT-009 | Agent↔capability grants | M | The `AgentCapability` join table records `agent_id`, `capability_id`, `granted_at`, `granted_by` |
 | FR-AGT-010 | Demo seeding | M | `scripts/seed_agents.py` populates 4–5 test agents before a demo run |
-| FR-AGT-011 (LYK) | Connection test on registration | C | The engine pings the agent's endpoint once at registration; the agent is only set `ACTIVE` if it responds, so a mistyped endpoint doesn't register cleanly and fail mid-demo |
+| FR-AGT-011 | Connection test on registration | M (promoted from LYK by ADR-009) | AGEM calls the agent's `GET /health` (FR-ADP-010) once at registration; the agent is only set `ACTIVE` if it responds. The engine pings the agent's endpoint once at registration; the agent is only set `ACTIVE` if it responds, so a mistyped endpoint doesn't register cleanly and fail mid-demo |
 | FR-AGT-012 (LYK) | Declared capability inventory | C | At registration an agent can optionally declare the capabilities it already has, stored on the Agent row for use during diagnosis (FR-DIAG-013) |
 
 ### 3.2 Adapter Layer / Interoperability (ADP) — Weeks 3, 7
@@ -124,13 +124,15 @@ Each requirement has an ID, priority and acceptance criteria (AC). Sections are 
 |---|---|---|---|
 | FR-ADP-001 | `base_adapter.py` contract | M | An abstract class defines exactly one method, `execute(input: dict) -> dict`; every adapter implements it |
 | FR-ADP-002 | REST/API adapter | M | `rest_adapter.py` calls an external agent over HTTP through the shared contract |
-| FR-ADP-003 | One framework adapter | M | `langchain_adapter.py` **or** `crewai_adapter.py` (one of the two), built by Week 7 |
+| FR-ADP-003 | One framework adapter | M | `langchain_adapter.py` **or** `crewai_adapter.py` (one of the two), built by Week 7. The framework agent runs behind its matching wrapper (FR-ADP-011) and is still reached over HTTP; the adapter handles that framework's request/response format |
 | FR-ADP-004 | Common I/O contract | M | Every adapter exposes the same shape: task input, context, requested capability/tool info, result, status, error |
 | FR-ADP-005 | Error normalisation at the boundary | M | Framework exceptions and structured agent errors are normalised inside `step_executor.py` to `{"status":"FAILED","error_type":"...","raw_error":"..."}` before diagnosis ever sees them |
 | FR-ADP-006 | Framework isolation | M | No framework-specific import exists outside `adapters/`; `orchestrator/` never changes when a new adapter is added |
 | FR-ADP-007 | Agents stay external and opaque | M | Agents are reached only over HTTP through an adapter; AGEM never imports agent code into its own process |
 | FR-ADP-008 | Adapter test suite | M | `test_adapters.py` covers a valid REST response, a timeout, and malformed JSON normalised into the standard error shape |
-| FR-ADP-009 (LYK) | MCP adapter | C | `mcp_adapter.py` implements the `base_adapter.py` contract against a Model Context Protocol server, added as one file with no change to `orchestrator/` |
+| FR-ADP-009 (LYK) | MCP adapter | C | `mcp_adapter.py` implements the `base_adapter.py` contract against a Model Context Protocol server, added as one file with no change to `orchestrator/`. HTTP (streamable HTTP) transport only; the `stdio` transport is forbidden because it would launch agent code on AGEM's machine (ADR-009) |
+| FR-ADP-010 | Agent HTTP contract | M | Every registered agent answers `GET /health` and `POST /execute` exactly as frozen in `docs/api-spec.md` (Architecture §16.1): request `{task, input, context}`; reply `{"status":"SUCCEEDED","output":{...}}` or `{"status":"FAILED","error":"MISSING_CAPABILITY","capability":"..."}` |
+| FR-ADP-011 | Wrapper templates | M | `agent_wrappers/` ships `python_wrapper.py` (Week 3) and the wrapper matching FR-ADP-003 (Week 7): a small FastAPI file that exposes a code-only agent over the FR-ADP-010 contract in the developer's own process, with no change to the agent's code |
 
 ### 3.3 Workflow Definition & DAG Validation (WFL) — Weeks 2, 4
 
@@ -153,11 +155,11 @@ Each requirement has an ID, priority and acceptance criteria (AC). Sections are 
 |---|---|---|---|
 | FR-ORC-001 | Non-blocking execution start | M | `POST /api/workflows/{id}/executions` returns `execution_id` immediately; the run proceeds via FastAPI `BackgroundTasks` |
 | FR-ORC-002 | Execution entry point | M | `Orchestrator.run_execution(execution_id: UUID) -> None` |
-| FR-ORC-003 | Sequential DAG execution | M | Steps run in the stored `step_order`, respecting declared dependencies |
-| FR-ORC-004 | Parallel sibling steps | M | Steps with no dependency between them run under `asyncio.gather` |
+| FR-ORC-003 | Sequential DAG execution | M | Steps run in the stored `step_order`; a step is READY when it is `PENDING` and every step in its `depends_on` is `SUCCEEDED`. The Orchestrator never plans or re-sorts — it only executes the user-defined, already-validated DAG |
+| FR-ORC-004 | Parallel sibling steps | M | READY steps with no dependency between them run under `asyncio.gather`; built after the sequential version works |
 | FR-ORC-005 | Automatic output→input passing | M | Step N's input includes the declared upstream step's output field(s), read from the Checkpoint, with no manual wiring |
 | FR-ORC-006 | Shared execution state | M | Task, agent outputs, current step, errors, capabilities and execution status are held as one shared state object |
-| FR-ORC-007 | Retry logic | M | A step retries automatically before being marked failed, per the routing in §3.6 (DIAG) |
+| FR-ORC-007 | Retry logic | M | A step diagnosed `NORMAL_ERROR` retries automatically, **at most 3 times**; if every retry fails the step is marked `FAILED` and the normalised error is shown in the step detail (§3.6 DIAG, ADR-008) |
 | FR-ORC-008 | Step state machine | M | Exactly 5 states: `PENDING → RUNNING → SUCCEEDED / FAILED / PAUSED`; `PAUSED` returns to `RUNNING` on resume or to `FAILED` after 3 attempts; `SUCCEEDED` and `FAILED` are terminal |
 | FR-ORC-009 | Transition guard | M | A single `can_transition(old, new)` function enforces legal transitions — explicitly not a State-pattern class hierarchy |
 | FR-ORC-010 | Execution status rollup | M | `Execution.status` derives from its steps: `PAUSED` if any step is paused, `FAILED` if any failed, `SUCCEEDED` only when every step succeeded |
@@ -187,27 +189,28 @@ Each requirement has an ID, priority and acceptance criteria (AC). Sections are 
 | ID | Requirement | Pri | Acceptance criteria |
 |---|---|---|---|
 | FR-DIAG-001 | Structured failure signal | M | The agent reports failure as a structured object, e.g. `{"error":"MISSING_CAPABILITY","capability":"..."}` |
-| FR-DIAG-002 | Single normalised error shape | M | Every exception or structured agent error becomes `{"status":"FAILED","error_type":"...","raw_error":"..."}` before diagnosis reads it |
+| FR-DIAG-002 | Single normalised error shape | M | Every exception or structured agent error becomes `{"status":"FAILED","error_type":"...","raw_error":"..."}` before diagnosis reads it. `error_type` is one of a fixed set of codes: `MISSING_CAPABILITY`, `TIMEOUT`, `CONNECTION_ERROR`, `HTTP_5XX`, `INVALID_JSON`, `AGENT_ERROR` (fallback for anything else). When the agent names the missing tool, an extra `capability` field carries that name to the Capability Engine |
 | FR-DIAG-003 | Binary classification | M | `Orchestrator.diagnose_failure(step_id, error) -> Literal["NORMAL_ERROR","CAPABILITY_GAP"]`; exactly two outcomes |
-| FR-DIAG-004 | One diagnosis call per failure | M | A hard budget cap of 1 LLM diagnosis call per failure |
+| FR-DIAG-004 | At most one diagnosis call per failure | M | A hard budget cap of **at most 1** LLM diagnosis call per failure; failures classified by the rules stage (FR-DIAG-014) use **0** LLM calls |
 | FR-DIAG-005 | Schema-constrained LLM output | M | Every diagnosis call requests JSON validated against a fixed Pydantic schema |
 | FR-DIAG-006 | Validation retry loop | M | On parse/validation failure, retry the same call up to 2 times with the validation error appended to the prompt |
 | FR-DIAG-007 | Fail-safe default | M | After retries are exhausted, or past a 20 s timeout, fail safe to `NORMAL_ERROR` rather than hang the workflow |
 | FR-DIAG-008 | Cheap model tier | M | Diagnosis uses a cheaper model tier; the stronger model is reserved for code generation in `builder.py` |
 | FR-DIAG-009 | Single LLM wrapper | M | No module calls the LLM API directly; every call goes through one wrapper handling the JSON request, validation, retry and fail-safe |
 | FR-DIAG-010 | Diagnosis visible in UI | M | The classification result appears in the step detail view, not only in logs |
-| FR-DIAG-011 | Accuracy evaluation | S | 20 hand-labelled error examples (10 genuine gaps, 10 normal errors) in `backend/tests/fixtures/`, scored as classification accuracy, **18/20 pass bar**, re-run whenever the prompt changes |
+| FR-DIAG-011 | Accuracy evaluation | S | 20 hand-labelled error examples (10 genuine gaps, 10 normal errors) in `backend/tests/fixtures/`, scored as classification accuracy, **18/20 pass bar**, re-run whenever the prompt changes. Every example must be one the rules stage (FR-DIAG-014) does **not** match, so the score measures the LLM, not the rules |
 | FR-DIAG-012 (LYK) | Diagnosis reason string | S | `diagnose_failure()` additionally returns a schema-validated `reason` and, when applicable, `missing_capability` field in the same call; `reason` is rendered in the step detail alongside the classification, at zero extra LLM cost |
 | FR-DIAG-013 (LYK) | Pre-check against declared inventory | C | Before spending an LLM call, diagnosis checks the agent's declared capability inventory (FR-AGT-012); a clear match short-circuits to `NORMAL_ERROR` without a diagnosis call |
+| FR-DIAG-014 | Rules-first diagnosis | M | Before any LLM call, `diagnose_failure()` classifies by fixed rules on `error_type`: `MISSING_CAPABILITY` → `CAPABILITY_GAP`; `TIMEOUT`, `CONNECTION_ERROR`, `HTTP_5XX`, `INVALID_JSON` → `NORMAL_ERROR`. Only unmatched errors (e.g. `AGENT_ERROR`) go to the LLM. The rules are deterministic code inside `master_agent.py` (ADR-008) |
 
 ### 3.7 Capability Engine (CAP) — Weeks 4–8
 
 | ID | Requirement | Pri | Acceptance criteria |
 |---|---|---|---|
-| FR-CAP-001 | Pipeline orchestration | M | `engine.py` runs the stages (normal-error check → free-tool search → build → sandbox → test → verify) as a simple ordered list of functions — not a class-per-handler hierarchy |
-| FR-CAP-002 | Free-tool search first | M | `Searcher.find_free_tool(capability_name) -> Tool \| None` always runs before the build path (ADR-003) |
+| FR-CAP-001 | Pipeline orchestration | M | `engine.py` runs the stages (registry check → free-tool search → build → static import check → sandbox → test → verify → register) as a simple ordered list of functions — not a class-per-handler hierarchy |
+| FR-CAP-002 | Free-tool search before build | M | `Searcher.find_free_tool(capability_name) -> Tool \| None` always runs before the build path (ADR-003), and after the registry check (FR-CAP-016) |
 | FR-CAP-003 | Search is a hardcoded check | M (simplified, disclosed) | The MVP search is a hardcoded web-search check, not a general tool-discovery system — the weakest link in the pipeline, documented as such rather than hidden |
-| FR-CAP-004 | Found → plug in and resume | M | If a free tool covers the gap, it is added to the workflow where needed and the paused step resumes — no build step at all |
+| FR-CAP-004 | Found → verify, then resume | M | If a free tool covers the gap, the build step is skipped, but the tool still goes through static import check → sandbox → test → verify before it is registered and used (ADR-004) |
 | FR-CAP-005 | Code generation | M | `Builder.build(capability_name, spec) -> str` returns Python source and never executes it |
 | FR-CAP-006 | Static import check | M | Generated code is scanned for disallowed imports (`os.system`, `subprocess`, `socket`, `open` outside a scratch dir) before it is ever sent to the sandbox |
 | FR-CAP-007 | Sandboxed execution | M | `Sandbox.run(code, inputs) -> SandboxResult` (see §3.8 SBX) |
@@ -218,14 +221,15 @@ Each requirement has an ID, priority and acceptance criteria (AC). Sections are 
 | FR-CAP-012 | Hard attempt cap | M | `resolve_gap()` returns `None` after **3 build/repair attempts**; the step is marked `FAILED` and `CAPABILITY_BUILD_FAILED` (500) is surfaced |
 | FR-CAP-013 | Registration | M | `Registry.register(name, version, code, score) -> Capability` writes to the PostgreSQL capability table |
 | FR-CAP-014 | Capability status lifecycle | M | `BUILDING / VERIFIED / FAILED`; only `VERIFIED` rows are ever handed to an agent or reused; `FAILED` rows are kept for the audit trail, never deleted |
-| FR-CAP-015 | Grant and resume | M | The verified capability is handed to the agent (`AgentCapability` row) and the exact paused step resumes |
-| FR-CAP-016 | Reuse / dedup | M | A second agent hitting the same gap finds the capability in the registry instead of rebuilding it (ADR-006) |
+| FR-CAP-015 | Grant and resume | M | Agents are remote, so AGEM runs the verified tool in the sandbox with the paused step's input and resumes the exact paused step with the result in `context.tool_results` (ADR-008). An `AgentCapability` row records the grant |
+| FR-CAP-016 | Registry check first / reuse | M | The registry is checked **first**, before search; a `VERIFIED` match is reused and the pipeline skips straight to resume, so a second agent hitting the same gap never rebuilds it (ADR-006) |
 | FR-CAP-017 | Timing budget | M | Build → sandbox → test → verify completes in **< 60 s end-to-end**, including at most one repair loop |
 | FR-CAP-018 | Generation evaluation | S | 5 canned gaps (the demo calculator plus four others) scored as the proportion reaching `VERIFIED` within the 3-attempt cap |
 | FR-CAP-019 | Reliable demo trigger | M | `scripts/trigger_capability_gap.py` reproducibly forces a capability gap so the search → build → sandbox → test → resume sequence can be demonstrated on demand |
 | FR-CAP-020 (LYK) | Generated code viewer | S | The Capabilities page can open a detail view showing the stored source code, the verification score, the 3 test inputs and the pass/fail result per input |
 | FR-CAP-021 (LYK) | Failed-attempt history | S | All 3 build attempts for a gap (code + failure reason) are stored, not only the final state, and are viewable in the capability detail view |
 | FR-CAP-022 (LYK) | Human-in-the-loop approval gate | C | A capability can optionally require user approval before being granted to an agent; the step enters an `APPROVAL_PENDING` sub-state and a narrowly-scoped approval endpoint (distinct from the general resume endpoint forbidden by FR-CKP-007) accepts approve/reject |
+| FR-CAP-023 (LYK) | MCP tool lookup | C | `searcher.py` additionally looks up the missing capability on a small configured list of MCP tool servers (HTTP transport only) before the build path; a match still goes through FR-CAP-004's checks. Turns the hardcoded "acquire" check into a real mechanism |
 
 ### 3.8 Sandbox & Code Safety (SBX) — Week 6
 
@@ -424,8 +428,8 @@ Each requirement has an ID, priority and acceptance criteria (AC). Sections are 
 ### 8.2 Test suite (from `backend/tests/`)
 
 - **`test_adapters.py`** — a REST agent returns a valid response; a REST agent times out; an agent returns malformed JSON and is normalised into the standard error shape.
-- **`test_orchestrator.py`** — a 2-step workflow runs in declared order; a cyclic definition is rejected at creation with `WORKFLOW_CYCLE_DETECTED`; a failed step pauses without re-running upstream steps; a resumed step reads its input from the checkpoint rather than recomputing it.
-- **`test_capability_engine.py`** — a gap where a free tool exists skips the build path entirely; a gap with no free tool builds, tests, verifies and registers; a capability that fails verification three times marks the step `FAILED` instead of looping.
+- **`test_orchestrator.py`** — a 2-step workflow runs in declared order; a cyclic definition is rejected at creation with `WORKFLOW_CYCLE_DETECTED`; a failed step pauses without re-running upstream steps; a resumed step reads its input from the checkpoint rather than recomputing it; each diagnosis rule `error_type` (FR-DIAG-014) maps to the right outcome and the mocked LLM wrapper is not called when a rule matches.
+- **`test_capability_engine.py`** — a gap already `VERIFIED` in the registry skips search and build; a gap where a free tool exists skips the build but still runs static check, sandbox, test and verify; a gap with no free tool builds, tests, verifies and registers; a capability that fails verification three times marks the step `FAILED` instead of looping.
 - **`test_sandbox.py`** — code attempting network access fails; code exceeding the timeout is killed; code exceeding the memory cap is killed; a benign function returns its result correctly.
 
 ### 8.3 LLM output evaluation
@@ -461,12 +465,12 @@ Each item is rated pass/fail; all Must-priority items must pass before the Week 
 | Module | Requirements | Source (Master Doc) | Phase (Week) | Test cases |
 |---|---|---|---|---|
 | AGT | FR-AGT-001–012 | BRD §6/§7, PRD US-01, LLD Agent entity | 3 | `test_adapters.py` (indirect), seed script |
-| ADP | FR-ADP-001–009 | BRD §6/§7, PRD US-03, ADR-005, LLD Key Interfaces | 3, 7 | `test_adapters.py` |
+| ADP | FR-ADP-001–011 | BRD §6/§7, PRD US-03, ADR-005, LLD Key Interfaces | 3, 7 | `test_adapters.py` |
 | WFL | FR-WFL-001–010 | BRD §6/§7, PRD US-02, LLD WorkflowAgent entity, Validation section | 2, 4 | `test_orchestrator.py` (cycle detection) |
 | ORC | FR-ORC-001–016 | BRD §6/§7, PRD US-02/US-04, HLD Design Points, LLD Design Points | 4–6 | `test_orchestrator.py` |
 | CKP | FR-CKP-001–009 | BRD §6/§7, PRD US-06, ADR-002, LLD Design Points | 5 | `test_orchestrator.py` (resume from checkpoint) |
-| DIAG | FR-DIAG-001–013 | BRD §6/§7, PRD US-05/US-07, ADR-001, AI Safety/Guardrails | 3, 6 | LLM evaluation set (§8.3) |
-| CAP | FR-CAP-001–022 | BRD §6/§7, PRD US-08, ADR-003/ADR-006, Failure Handling section | 4–8 | `test_capability_engine.py`, generation evaluation |
+| DIAG | FR-DIAG-001–014 | BRD §6/§7, PRD US-05/US-07, ADR-001, AI Safety/Guardrails | 3, 6 | LLM evaluation set (§8.3) |
+| CAP | FR-CAP-001–023 | BRD §6/§7, PRD US-08, ADR-003/ADR-006, Failure Handling section | 4–8 | `test_capability_engine.py`, generation evaluation |
 | SBX | FR-SBX-001–012 | BRD §8 NFR Security, ADR-004, Security Design | 6 | `test_sandbox.py` |
 | UI | FR-UI-001–015 | PRD UX Requirements, BRD §6/§7 | 9–10 | Manual UAT checklist |
 | API | FR-API-001–007 | LLD API Specification | 3+ | Integration tests |
@@ -504,7 +508,7 @@ LYK items (FR-*-0xx marked "LYK") are not pinned to a specific week — they are
 |---|---|---|---|
 | OI-01 | Which framework adapter — LangChain or CrewAI | Either is acceptable per ADR-005; pick based on which the team is more comfortable with by Week 7 | Week 7 |
 | OI-02 | Redis/Celery addition | Only if the async job queue becomes a real pain point; not before Week 8 (ADR-007) | Week 8 |
-| OI-03 | MCP adapter (FR-ADP-009) | Build only if Week 8 lands on schedule — it is the single highest-upside LYK item | Week 8 checkpoint |
+| OI-03 | MCP adapter (FR-ADP-009) and MCP tool lookup (FR-CAP-023) | Build only if Week 8 lands on schedule — highest-upside LYK items; HTTP transport only (ADR-009) | Week 8 checkpoint |
 | OI-04 | Approval gate (FR-CAP-022) vs. BR-07 (no public resume endpoint) | If built, the approval endpoint must be narrowly scoped to capability approval only, explicitly distinct from a general resume endpoint | Before FR-CAP-022 is built |
 | OI-05 | Real tool discovery replacing the hardcoded search (FR-CAP-003) | Out of scope for this project; note as Future Scope in the README | — |
 | OI-06 | Formal/property-based verification replacing the type/range check (FR-CAP-010) | Out of scope for this project; note as Future Scope in the README | — |
