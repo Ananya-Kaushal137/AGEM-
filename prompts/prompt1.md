@@ -29,7 +29,7 @@ app/models/ — database tables (Prompt 2 fills this)
 app/core/config.py — the only place secrets get read. Your docs are strict about this (rule P16).
 orchestrator/ — the thing that runs your workflow step by step, and master_agent.py which asks the LLM "why did this step fail?"
 adapters/ — how you talk to agents built in different frameworks (REST, LangChain, CrewAI). This is your "works with anything" story.
-capability_engine/ — your star feature. 7 files, one per step: search for a free tool → build one with the LLM → run it in a sandbox → test it → verify it → register it.
+capability_engine/ — your star feature. 7 files, one per step: ask the Web Research Agent (free tool, formula, examples) → build one with the LLM → run it in a sandbox → test it → verify it (≥ 90%, refined with failing cases) → register it.
 tests/ — the 4 test files your FRS requires
 sandbox_runner/ — a separate, tiny, locked-down box where LLM-written code is allowed to run. Separate on purpose, because you don't let untrusted code run in your main app.
 

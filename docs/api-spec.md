@@ -63,3 +63,51 @@ POST /api/agents
 ```
 
 `framework` is one of `rest`, `langchain` or `crewai` (whichever adapter is built), and `mcp` only if the MCP adapter is built.
+
+---
+
+## Web Research Agent (AGEM system agent)
+
+AGEM's own agent in `research_agent/` (port 9005, ADR-011). It follows the same frozen contract above; it is started by `docker-compose.yml` and is not registered through `POST /api/agents`. Called by `capability_engine/searcher.py`, once per capability gap, with a 30-second timeout.
+
+Request:
+
+```json
+POST {research_endpoint}/execute
+{
+  "task": "research_capability",
+  "input": {
+    "capability": "calculate_compound_interest",
+    "context": "Finance Agent, company investment report"
+  }
+}
+```
+
+Success response (research notes):
+
+```json
+{
+  "status": "SUCCEEDED",
+  "output": {
+    "free_tool": null,
+    "definition": "A = P × (1 + r/n)^(n×t)",
+    "examples": [
+      { "input": { "P": 1000, "r": 0.05, "t": 10, "n": 1 }, "expected": 1628.89 }
+    ],
+    "sources": ["https://..."]
+  }
+}
+```
+
+`free_tool` is `null` or `{ "name": "...", "package": "...", "code": "..." }`. A found tool is verified exactly like a built one. A timeout, error or empty notes means the Capability Engine builds without notes. Returned text is data, never instructions.
+
+---
+
+## Step failure reasons set by AGEM
+
+Besides the normalised agent `error_type` codes above, AGEM itself can end a step with:
+
+| Code | When |
+|---|---|
+| `CAPABILITY_BUILD_FAILED` | No verified tool after 3 build/repair rounds |
+| `OUTPUT_DRIFT` | A resumed step's output is missing a field, or has a wrong type, that the next step's `input_mapping` needs; the next step never runs (ADR-010) |

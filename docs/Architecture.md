@@ -67,7 +67,9 @@ The two-person team building AGEM, and anyone reviewing or examining it.
 | Orchestrator | The engine that runs a workflow: decides which agent goes next, passes data between agents, handles state. |
 | Capability | A specific skill or tool an agent needs but might not have (e.g. "calculate compound interest"). |
 | Tool | The actual implementation of a capability (a Python function, an API call). |
-| Capability Engine | The system that detects a capability gap and resolves it: search → build → sandbox → test → verify → register. |
+| Capability Engine | The system that detects a capability gap and resolves it: research → build → sandbox → test → verify → register. |
+| Web Research Agent | AGEM's own system agent that searches the web when a capability is missing, returning a free tool (if any), the formula and worked examples. |
+| Output drift | A resumed step's output no longer fitting what the next step expects (missing field or wrong type). |
 | Adapter | A wrapper that translates a specific agent's interface (LangChain/CrewAI/REST) into AGEM's standard contract, so the Orchestrator doesn't need to know what framework the agent uses. |
 | Registry | A database table of verified capabilities so they can be reused instead of rebuilt. |
 | Sandbox | An isolated Docker container where untrusted generated code runs safely without access to the main system. |
@@ -138,12 +140,12 @@ AGEM is not just an agent builder, a chatbot, an n8n replacement, a workflow edi
 
 | Attribute | Target | How the architecture achieves it |
 |---|---|---|
-| Performance | 1–5 concurrent executions; <300 ms orchestrator overhead per step; 3 s dashboard refresh; diagnosis <8 s typical (20 s timeout); capability build→sandbox→test→verify loop <60 s | Async FastAPI `BackgroundTasks`, `asyncio.gather` for sibling steps, deterministic bookkeeping separated from agent/LLM call time |
+| Performance | 1–5 concurrent executions; <300 ms orchestrator overhead per step; 3 s dashboard refresh; diagnosis <8 s typical (20 s timeout); web research ≤30 s; capability build→sandbox→test→verify loop <90 s (up to 3 refinement rounds) | Async FastAPI `BackgroundTasks`, `asyncio.gather` for sibling steps, deterministic bookkeeping separated from agent/LLM call time |
 | Security | Never run untrusted code on the main server | Per-run Docker container, no internet, resource caps, secret isolation, controlled network access, audit logs |
 | Reliability | Retry/recovery logic and step checkpoints so execution resumes without restarting | Step-level pause, checkpoint written twice per step, bounded retries |
 | Auditability | Execution history, errors, recovery events, capability acquisition/build history, and verification results recorded as outputs | Structured logging correlated by `execution_id`/`step_id`/`agent_id`; `FAILED` capability rows kept, never deleted |
 | Accessibility | A deliberate baseline, not a full WCAG audit | Semantic HTML over generic divs, visible keyboard focus states, labelled form inputs, status badges pairing colour with a text label or icon |
-| Cost | LLM API usage bounded by hard call budgets | At most 1 diagnosis call per failure, at most 3 build/repair attempts per gap; cheaper model tier for diagnosis, stronger model for code generation; no GPU or local model hosting |
+| Cost | LLM API usage bounded by hard call budgets | At most 1 diagnosis call per failure, at most 1 web research call per gap, at most 3 build/repair attempts per gap; cheaper model tier for diagnosis, stronger model for code generation; no GPU or local model hosting |
 
 ---
 
@@ -272,6 +274,7 @@ Semantic HTML elements over generic divs, visible keyboard focus states, labelle
 | `WORKFLOW_CYCLE_DETECTED` | 400 | Workflow creation rejected because the declared dependencies are not a valid DAG |
 | `UNAUTHORIZED` | 401 | Missing or invalid `X-API-Key` header |
 | `CAPABILITY_BUILD_FAILED` | 500 | The Capability Engine exhausted its repair-attempt limit without producing a verified capability |
+| `OUTPUT_DRIFT` | 500 | A resumed step's output is missing a field, or has a wrong type, that the downstream step's `input_mapping` needs; the step is marked `FAILED` and the downstream step never runs |
 
 ### 10.3 Endpoint groups
 
@@ -331,7 +334,9 @@ run_execution(execution_id):
                 CAPABILITY_GAP -> CapabilityEngine.resolve_gap(capability_name, context)
                     reused/found/built + verified -> run tool in sandbox,
                         resume exact step with context.tool_results
-                    exhausted (3 attempts) -> mark step FAILED
+                        output drift check against downstream input_mapping
+                            pass -> SUCCEEDED; fail -> FAILED (OUTPUT_DRIFT)
+                    exhausted (3 rounds) -> mark step FAILED
 
     Execution.status rolls up from its steps:
         PAUSED if any step is PAUSED
@@ -361,6 +366,8 @@ These are concrete controls, not aspirations — each maps to a specific setting
 | Schema-constrained LLM output | Every LLM call requests a JSON response constrained to a fixed Pydantic schema | `master_agent.py`, `builder.py` |
 | Validation retry + fail-safe | Retry the same call up to 2 times with the validation error appended to the prompt; after that, fail safe to `NORMAL_ERROR` rather than proceed on an unvalidated response | LLM wrapper (single entry point, no module calls the LLM API directly) |
 | Bounded build/repair attempts | A hard cap of 3 build/repair attempts per capability gap | `capability_engine/` — after 3 failures the step is marked `FAILED` and surfaced to the user instead of looping indefinitely |
+| Web content is data | Text returned by the Web Research Agent is never followed as instructions; code found on the web goes through the same static check → sandbox → test → verify as built code; one research call per gap, 30 s timeout | `capability_engine/searcher.py`, `research_agent/` (ADR-011) |
+| Output drift guard | After a resumed step finishes, its output is checked against the downstream step's `input_mapping` (fields present, right types) before it is marked `SUCCEEDED` | `orchestrator/step_executor.py` (ADR-010) |
 | Full audit logging | Every LLM call and every sandbox execution is logged (prompt, response, verdict) | Structured JSON logs — this is the only way to explain after the fact why a given generated tool was trusted |
 
 ---
@@ -375,18 +382,23 @@ flowchart LR
     D -->|NORMAL_ERROR| R[Retry step, max 3, then FAILED]
     D -->|CAPABILITY_GAP| RC[Registry: VERIFIED match?]
     RC -->|yes| RESUME
-    RC -->|no| S[Searcher: free / accessible tool?]
-    S -->|found| IC[Static import check]
-    S -->|not found| B[Builder: LLM generates Python source]
+    RC -->|no| S[Searcher: ask Web Research Agent]
+    S -->|free tool found| IC[Static import check]
+    S -->|no free tool; notes: formula + examples| B[Builder: LLM generates Python source from notes]
     B --> IC
     IC --> SB[Sandbox: fresh container, no network, 10s timeout]
-    SB --> T[Tester: run against 3 sample inputs]
-    T --> V[Verifier: output type / range check]
+    SB --> T[Tester: ~10 cases, each run 3 times]
+    T --> V[Verifier: accuracy >= 90%, 0 regression, consistent]
     V -->|pass| REG[Registry: register capability]
     REG --> RESUME[Run tool in sandbox, resume exact step with tool_results]
-    V -->|fail, attempts less than 3| B
-    V -->|fail, 3 attempts exhausted| FAIL[Step FAILED, CAPABILITY_BUILD_FAILED]
+    RESUME --> DR{Output drift check}
+    DR -->|pass| OK[Step SUCCEEDED]
+    DR -->|fail| DF[Step FAILED, OUTPUT_DRIFT]
+    V -->|fail, rounds less than 3: failing cases fed back| B
+    V -->|fail, 3 rounds exhausted| FAIL[Step FAILED, CAPABILITY_BUILD_FAILED]
 ```
+
+The LLM is **not** fine-tuned. What is refined is the generated tool: failing cases (input, returned value, expected value) are fed back into the next build prompt until the tool passes all checks (ADR-010). The Web Research Agent is a system agent that searches the web because the LLM cannot (ADR-011). Plain-language walkthrough: `docs/final_flow.md` §5.2–5.4.
 
 ### 13.2 Key interfaces (function signatures)
 These signatures are the contract between the two people's work — fixing them lets both build in parallel from Week 3 without waiting on each other.
@@ -394,12 +406,13 @@ These signatures are the contract between the two people's work — fixing them 
 | Signature | File |
 |---|---|
 | `CapabilityEngine.resolve_gap(capability_name: str, context: dict) -> Capability \| None` | `capability_engine/engine.py` |
-| `Searcher.find_free_tool(capability_name: str) -> Tool \| None` | `capability_engine/searcher.py` |
-| `Builder.build(capability_name: str, spec: dict) -> str` — returns Python source, never executes it | `capability_engine/builder.py` |
+| `Searcher.research(capability_name: str, context: dict) -> ResearchNotes` — calls the Web Research Agent; `ResearchNotes` = `free_tool: Tool \| None`, `definition`, `examples`, `sources`; empty notes on timeout/error | `capability_engine/searcher.py` |
+| `Builder.build(capability_name: str, spec: dict, notes: ResearchNotes, feedback: list[dict] \| None) -> str` — returns Python source, never executes it; `feedback` = failing cases from the previous round | `capability_engine/builder.py` |
 | `Sandbox.run(code: str, inputs: list[dict]) -> SandboxResult` | `capability_engine/sandbox.py` |
-| `Tester.test(code: str, samples: list[dict]) -> TestResult` — 3 sample inputs for MVP | `capability_engine/tester.py` |
-| `Verifier.verify(result: TestResult, expected_type: type, expected_range: tuple \| None) -> float` — returns the `verification_score` | `capability_engine/verifier.py` |
+| `Tester.test(code: str, cases: list[dict], runs: int = 3) -> TestResult` — about 10 cases, each run 3 times, in one sandbox run | `capability_engine/tester.py` |
+| `Verifier.verify(result: TestResult, previous: TestResult \| None) -> Verification` — accuracy, regression, consistency; `score` = accuracy; passes at ≥ 0.9 with 0 regressions and all cases consistent | `capability_engine/verifier.py` |
 | `Registry.register(name: str, version: str, code: str, score: float) -> Capability` | `capability_engine/registry.py` |
+| `check_output_drift(output: dict, downstream_steps: list[Step]) -> list[str]` — returns missing / wrong-type fields; empty = no drift | `orchestrator/step_executor.py` |
 
 ### 13.3 Design patterns
 - **Chain of Responsibility:** the diagnosis/recovery pipeline (normal-error check → free-tool search → build → sandbox → test → verify) is implemented as a simple ordered list of functions called in sequence — explicitly *not* a formal class-per-handler OOP hierarchy, since that ceremony buys nothing at this scale.
@@ -414,9 +427,9 @@ A fresh container per run, code and inputs passed in by file mount, `--network n
 |---|---|
 | Agent reports missing capability | REAL — structured error object, e.g. `{"error": "MISSING_CAPABILITY", "capability": "..."}` |
 | Detect missing capability | REAL — `master_agent.py` calls the LLM and classifies the failure |
-| Build/acquire capability | REAL for "build" (LLM generates a Python function). SIMPLIFIED for "acquire" (a hardcoded web-search check, not a general discovery system) |
+| Build/acquire capability | REAL for "build" (LLM generates a Python function from the research notes). REAL for "research" (the Web Research Agent searches the web, one call, 30 s). SIMPLIFIED for "acquire" (a free tool is only used if the research names one; no general discovery system or marketplace) |
 | Sandbox | REAL — a separate Docker container, no internet access, execution timeout. Not simplified: this is a core safety claim |
-| Test / Verify | REAL for test (3 sample inputs). SIMPLIFIED for verify (output type/range check, not full formal verification) |
+| Test / Verify | REAL — about 10 cases (reference answers from research or hand-written, edge cases, property checks), each run 3 times; accuracy ≥ 90%, 0 regression, consistent outputs; output drift checked after resume. SIMPLIFIED in that it proves correctness on the test cases only, not full formal verification |
 | Register | REAL — written to the capability table in PostgreSQL |
 | Agent resumes | REAL — the Orchestrator resumes the paused step and passes the new capability to the agent |
 | Another agent reuses the capability | REAL but simple — a second agent hitting the same gap finds it in the registry instead of rebuilding it |
@@ -431,7 +444,7 @@ A fresh container per run, code and inputs passed in by file mount, `--network n
 |---|---|
 | User | `user_id, email, api_key_hash, created_at` — MVP has no login, so a single seeded user row owns everything |
 | Agent | `agent_id, user_id, name, framework, endpoint/runtime, description, status` |
-| Capability | `capability_id, name, version, source, status, verification_score, implementation reference` |
+| Capability | `capability_id, name, version, source, status, verification_score, implementation reference, research_notes (JSONB), test_cases (JSONB)` — the last two are added by a **second** Alembic migration (Prompt 10), never by editing the first |
 | AgentCapability | `agent_capability_id, agent_id, capability_id, granted_at, granted_by` — join table |
 | Workflow | `workflow_id, user_id, name, definition, status` |
 | WorkflowAgent | `workflow_agent_id, workflow_id, agent_id, step_order, depends_on, input_mapping` |
@@ -666,12 +679,12 @@ Final task result; execution history; agent outputs; errors and recovery events;
 
 ## 22. Cost Architecture
 
-The only real variable cost in AGEM's MVP is LLM API calls, made from exactly two places: `master_agent.py` (failure diagnosis) and `builder.py` (capability generation).
+The only real variable cost in AGEM's MVP is LLM API calls (plus the web search API used by the Web Research Agent), made from exactly three places: `master_agent.py` (failure diagnosis), the Web Research Agent (summarising search results, one call per gap) and `builder.py` (capability generation and repair).
 
 | Decision | Detail |
 |---|---|
 | Cheaper model tier for diagnosis | Classifying a failure as `NORMAL_ERROR` vs. `CAPABILITY_GAP` is a short prompt with a small structured JSON output — it does not need a top-tier model. A stronger model is reserved specifically for capability code generation in `builder.py`, where correctness matters far more. The single highest-leverage cost decision available |
-| Hard call budget per execution | At most 1 diagnosis call per failure; at most 3 build/repair attempts per capability gap. Bounds worst-case LLM cost per demo run to a small, predictable number of calls |
+| Hard call budget per execution | At most 1 diagnosis call per failure; at most 1 web research call per capability gap (results saved in the registry, never repeated); at most 3 build/repair attempts per capability gap. Bounds worst-case LLM cost per demo run to a small, predictable number of calls |
 | No local model hosting | A hosted LLM API (OpenAI or Anthropic) is used rather than running a model locally — avoids GPU infrastructure cost and setup time entirely |
 | No infrastructure cost beyond the LLM bill | PostgreSQL, Docker, and the sandbox all run locally via docker-compose for the build and the demo |
 
@@ -689,8 +702,9 @@ Every step execution is wrapped in try/except inside `step_executor.py`. Any exc
 | Step succeeds | Orchestrator moves to the next step normally |
 | Step fails — normal error | Only that step pauses; retried up to 3 times, then marked `FAILED` — no rebuilding needed |
 | Step fails — capability gap, already in registry | The `VERIFIED` capability is reused; the paused step resumes |
-| Step fails — capability gap, free tool exists | Tool goes through static check → sandbox → test → verify, then the paused step resumes |
-| Step fails — capability gap, no free tool | Capability Engine builds → static check → sandbox → test → verify |
+| Step fails — capability gap, free tool exists | Web Research Agent names it; tool goes through static check → sandbox → test → verify, then the paused step resumes and its output is drift-checked |
+| Step fails — capability gap, no free tool | Capability Engine builds from the research notes → static check → sandbox → test → verify, refined with failing-case feedback (max 3 rounds) |
+| Resumed step's output does not fit the next step | Step marked `FAILED` (`OUTPUT_DRIFT`); the downstream step never runs |
 | Verification fails | Improve/rebuild the capability and test again, bounded by the retry limit |
 | Verification passes | Capability is registered, run in the sandbox, and its result is passed to the exact step as it resumes |
 
@@ -745,11 +759,11 @@ agem/
 │   │
 │   ├── capability_engine/
 │   │   ├── engine.py       main capability gap resolution flow
-│   │   ├── searcher.py     checks for existing free tools first
-│   │   ├── builder.py      LLM-based tool generation
+│   │   ├── searcher.py     asks the Web Research Agent: free tool, formula, worked examples
+│   │   ├── builder.py      LLM-based tool generation, refined with failing-case feedback
 │   │   ├── sandbox.py      isolated execution (Docker subprocess)
-│   │   ├── tester.py       runs tool against sample inputs
-│   │   ├── verifier.py     stricter correctness check
+│   │   ├── tester.py       runs tool against ~10 cases, each 3 times
+│   │   ├── verifier.py     accuracy ≥ 90%, 0 regression, consistency
 │   │   └── registry.py     stores verified capabilities
 │   │
 │   └── tests/
@@ -769,13 +783,15 @@ agem/
 │
 ├── demo_agents/            Research · Finance · Fact Checker · Writer — each wrapped, own container (ports 9001–9004)
 │
+├── research_agent/         Web Research Agent — AGEM's own system agent, own container (port 9005), same /health + /execute contract
+│
 ├── database/
 │   └── init.sql            base schema if needed outside migrations
 │
 ├── docs/
 │   ├── architecture.md
 │   ├── api-spec.md
-│   ├── adr/                ADR-001-separate-sandbox.md · ADR-002-orchestrator-master-agent.md · ADR-008-rules-first-diagnosis.md · ADR-009-agent-registration-over-http.md
+│   ├── adr/                ADR-001-separate-sandbox.md · ADR-002-orchestrator-master-agent.md · ADR-008-rules-first-diagnosis.md · ADR-009-agent-registration-over-http.md · ADR-010-refine-until-verified.md · ADR-011-web-research-agent.md
 │   ├── final_flow.md          plain-language guide to the whole flow, Bring → Complete
 │   ├── failure_diagnosis.md   plain-language guide to diagnosis and recovery
 │   └── demo-script.md
@@ -802,7 +818,7 @@ agem/
 | Unit/Integration | `test_adapters.py`, `test_orchestrator.py`, `test_capability_engine.py`, `test_sandbox.py` | Pytest |
 | Coverage target | 70% line coverage across `backend/orchestrator/`, `backend/adapters/` and `backend/capability_engine/`. API layer and models are deliberately excluded | pytest-cov, measured in CI |
 | LLM output evaluation (diagnosis) | A fixed, hand-labelled set of 20 error examples (10 genuine capability gaps, 10 normal errors), scored as classification accuracy, **18/20 pass bar**, re-run whenever the diagnosis prompt changes | Pytest, real API calls |
-| LLM output evaluation (generation) | Scored against 5 canned gaps — the calculator gap used in the demo plus four others — as the proportion reaching `VERIFIED` within the 3-attempt cap | Pytest, real API calls |
+| LLM output evaluation (generation) | Scored against 5 canned gaps — the calculator gap used in the demo plus four others — as the proportion reaching `VERIFIED` (accuracy ≥ 90%, 0 regression, consistent) within the 3-round cap | Pytest, real API calls |
 | CI/CD | One GitHub Actions workflow on every push/PR to `main`: (1) backend — install, `ruff`/`flake8` lint, `pytest`; (2) frontend — `npm ci`, `tsc --noEmit`, `npm run build`. No automatic deployment step | GitHub Actions |
 
 LLM calls are mocked in unit tests. Real API calls happen only in the two evaluation runs, so CI stays free, fast and deterministic.
@@ -818,7 +834,7 @@ After the first migration exists, schema changes go through Alembic only — no 
 ## 28. User Flow
 
 ### 28.1 Demo flow
-Import 4–5 agents → recognize them → create workflow → deploy → start task → execute → intentionally trigger a capability gap (via `scripts/trigger_capability_gap.py`) → check free tool first → if none, acquire/build → sandbox → test → verify → give capability to agent → resume exact step → complete final report.
+Import 4–5 agents → recognize them → create workflow → deploy → start task → execute → intentionally trigger a capability gap (via `scripts/trigger_capability_gap.py`) → Web Research Agent checks for a free tool and finds the formula → if none, build → sandbox → test → verify (refined until ≥ 90%) → give capability to agent → resume exact step → complete final report.
 
 ### 28.2 Illustrative scenarios
 
@@ -844,7 +860,7 @@ Dashboard, agent registry, workflow graph, execution trace, step status, capabil
 | Master Agent / Supervisor | `orchestrator/master_agent.py` (inside Orchestrator service) | Week 3 (basic), Week 6 (wired) |
 | Step-Level Pause/Resume | `checkpoint_manager.py`; PostgreSQL Checkpoint table | Week 5 |
 | Failure Diagnosis | `master_agent.py` | Week 6 |
-| Capability Engine | `capability_engine/` (searcher, builder, sandbox, tester, verifier, registry) | Weeks 4–8 |
+| Capability Engine | `capability_engine/` (searcher, builder, sandbox, tester, verifier, registry) + `research_agent/` | Weeks 4–8 |
 | Deployment and Monitoring | Frontend dashboard; API Layer | Weeks 9–10 |
 
 ---
@@ -878,7 +894,7 @@ Decision: document and diagram supervision/diagnosis (Master Agent) as separate 
 Decision: pause and checkpoint only the failed step. Rationale: restarting a whole multi-step workflow after one failure wastes time/cost and re-runs already-successful agent work.
 
 **ADR-003 — Check for a Free/Accessible Tool Before Building One**
-Decision: always check for an existing free/accessible tool before invoking the Capability Engine's build path; for MVP this check is a simplified hardcoded web-search check. Rationale: building/generating a tool is expensive and riskier; checking first avoids unnecessary generation.
+Decision: always check for an existing free/accessible tool before invoking the Capability Engine's build path; this check is done by the Web Research Agent (ADR-011), which also returns the formula and worked examples used by the build and verify stages. Rationale: building/generating a tool is expensive and riskier; checking first avoids unnecessary generation.
 
 **ADR-004 — Sandbox Before Trusting Any New/Generated Capability**
 Decision: every newly built or acquired capability runs in a separate Docker container before being trusted, regardless of any other MVP simplification. Rationale: a newly built or acquired capability is unverified code — isolation limits the blast radius of a bad or malicious tool. Treated as non-negotiable, unlike other MVP simplifications.
@@ -897,6 +913,12 @@ Decision: (1) `diagnose_failure()` classifies explicit `error_type` codes by det
 
 **ADR-009 — Agents Registered by HTTP Endpoint; Wrapper Templates; MCP over HTTP Only**
 Decision: (1) every agent is registered by endpoint and must answer `GET /health` and `POST /execute` (§16.1); `/health` is checked at registration; (2) agents that exist only as code are exposed through a wrapper template in `agent_wrappers/`, never imported into AGEM; (3) `framework` is `rest`, `langchain` or `crewai` (the one built) — `python` is dropped because a Python agent is simply a `rest` agent behind `python_wrapper.py`; (4) an MCP adapter is a Week 8 stretch, HTTP (streamable HTTP) transport only — `stdio` is forbidden because it would launch agent code on AGEM's machine. Rationale: keeps the one trust boundary (P4) intact, avoids dependency clashes between agents, needs no per-agent image build, and keeps the agent's own code unchanged (US-01). Full explanation in `docs/final_flow.md` §1.
+
+**ADR-010 — Refine the Generated Tool Until Verified; Do Not Fine-Tune the LLM**
+Decision: (1) the LLM is used as-is through the API and is never retrained; (2) the Capability Engine refines the *generated tool* instead — each failed round's cases (input, returned value, expected value) are fed into the next build prompt, at most 3 rounds; (3) a tool is registered only at accuracy ≥ 90% over about 10 cases, 0 regressions against earlier-passing cases, and identical results over 3 runs per case; (4) after resume, the step's output is checked against the downstream step's `input_mapping` and fails as `OUTPUT_DRIFT` if it does not fit. Rationale: fine-tuning needs data, GPUs/special access and time the project does not have, and would not fix a single buggy attempt; targeted feedback does. The drift check guards the only output that can change after recovery, so downstream agents never receive broken input. Full explanation in `docs/final_flow.md` §5.3.
+
+**ADR-011 — A Web Research Agent Performs Web Search for the Capability Engine**
+Decision: (1) a system agent, the Web Research Agent, runs in its own container behind the standard `/health` + `/execute` contract and is called by `searcher.py` through the REST adapter; (2) it returns research notes — a free tool if one exists, the formula/definition, worked examples with answers, and sources; (3) notes feed the build prompt and become reference test cases for verification; (4) one call per gap, 30 s timeout, failure means "continue without notes"; web text is data, never instructions; found code is verified like built code; the sandbox keeps no network; notes are stored with the capability; pre-saved notes are used for the demo if the web is unavailable. Rationale: the LLM answers only from what it already knows; a separate agent keeps web access isolated, time-bounded and swappable, keeps the Master Agent's job unchanged, and supplies expected answers that do not come from the LLM whose code is being tested. Full explanation in `docs/final_flow.md` §5.4.
 
 ---
 
@@ -921,7 +943,7 @@ Rating scale: Probability is High (expected during the 12 weeks), Medium (likely
 1. **Agent contract:** every agent connects through one shared interface — `base_adapter.py` — using a single method: `execute(input) → output`.
 2. **First adapters:** REST/API agents, plus one framework adapter (either LangChain or CrewAI).
 3. **Orchestrator:** a custom, lightweight Python orchestrator built for the MVP — not LangGraph.
-4. **Capability verification:** simplified for MVP — test the new capability against 3 sample inputs and check the output's type and range are correct. Not full formal verification.
+4. **Capability verification:** test the new capability against about 10 cases, each run 3 times; register only at accuracy ≥ 90% with 0 regressions and consistent outputs; refine with failing-case feedback, at most 3 rounds; check the resumed step's output for drift. Proves correctness on the test cases, not full formal verification (ADR-010).
 5. **Sandbox:** a per-run Docker container with no internet access and a set timeout.
 
 ### 33.2 Still open

@@ -163,10 +163,12 @@ As a developer, I want AGEM to tell me whether a failure was a normal error or a
 As a developer, I want AGEM to automatically find or build a missing tool, test and verify it, and hand it to my agent, so that my workflow can complete without me writing new code mid-run.
 
 **Acceptance criteria**
-- A free or already-accessible tool is always checked for before anything is built.
+- A free or already-accessible tool is always checked for before anything is built — by the Web Research Agent, which also returns the formula and worked examples used to build and verify the tool.
+- A tool is registered only at accuracy ≥ 90% on its test cases, with 0 regressions and consistent results; failing cases are fed back to the LLM for each repair. The LLM itself is not fine-tuned.
+- After the step resumes, its output is checked against what the next step needs; if it does not fit, the step is marked `FAILED` (`OUTPUT_DRIFT`) and the next agent never receives it.
 - A registered Capability row with a `verification_score` exists, and the paused step resumes and succeeds using it, with zero manual code deployment by the developer.
 - Every newly built or acquired capability runs in the sandbox before being trusted.
-- After 3 build/repair attempts the step is marked `FAILED` and surfaced to the user instead of looping indefinitely.
+- After 3 build/repair rounds the step is marked `FAILED` and surfaced to the user instead of looping indefinitely.
 - A second agent hitting the same gap finds the capability in the registry instead of rebuilding it.
 
 ### US-09
@@ -195,7 +197,7 @@ As a developer, I want to read the code AGEM generated for a capability, so that
 *Should · traces to FR-CAP-020, FR-UI-013*
 
 **Acceptance criteria**
-- The Capabilities page opens a read-only detail view showing the stored source code, the `verification_score`, the 3 test inputs, and pass/fail per input.
+- The Capabilities page opens a read-only detail view showing the stored source code, the `verification_score`, the test cases, pass/fail per case, and the research sources.
 - No new data is collected — all of it is already stored by `Registry.register()`.
 
 ### US-12 (LYK)
