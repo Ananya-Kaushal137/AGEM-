@@ -55,8 +55,9 @@ Rows marked **(LYK)** are additive proposals specified in the FRS rather than in
 | **(LYK)** Failed-attempt history on a capability (all 3 attempts kept) | Should |
 | **(LYK)** Token and cost counter rolled up per execution | Should |
 | **(LYK)** Execution report export (`GET /api/executions/{id}/report`) | Should |
-| **(LYK)** Connection test at agent registration | Could |
-| **(LYK)** MCP adapter (`mcp_adapter.py`) | Could |
+| Connection test at agent registration (`GET /health`) — promoted to Must by ADR-009 | Must |
+| **(LYK)** MCP adapter (`mcp_adapter.py`), HTTP transport only | Could |
+| **(LYK)** MCP tool lookup in the Capability Engine's search step (FR-CAP-023) | Could |
 | **(LYK)** Declared capability inventory per agent, used as a diagnosis pre-check | Could |
 | **(LYK)** Human-in-the-loop approval gate before a capability is granted | Could |
 | **(LYK)** Conditional / branching workflow steps | Could |
@@ -103,8 +104,9 @@ As a developer, I want to register my existing agent (Python, JS, REST/API, Lang
 
 **Acceptance criteria**
 - Agent appears in the Agent Registry with status `ACTIVE` after `POST /api/agents`.
-- No change to the agent's own source code is required — only adapter configuration.
-- `framework` must be one of a fixed enum (`python`, `rest`, `langchain`, `crewai`) matching an available adapter; anything else is rejected immediately at registration rather than failing later at execution time.
+- The agent is registered by its HTTP endpoint and answers the `/health` + `/execute` contract (FR-ADP-010); a code-only agent is exposed through a wrapper template (FR-ADP-011). No agent code is ever imported into AGEM.
+- No change to the agent's own source code is required — only adapter configuration (and, for code-only agents, a thin wrapper around it).
+- `framework` must be one of a fixed enum (`rest`, `langchain` or `crewai` — whichever adapter is built — and `mcp` only if built) matching an available adapter; anything else is rejected immediately at registration rather than failing later at execution time. A plain Python agent registers as `rest`.
 - An agent referenced by an active workflow cannot be deleted — `DELETE /api/agents/{id}` returns 409.
 
 ### US-02
@@ -153,7 +155,7 @@ As a developer, I want AGEM to tell me whether a failure was a normal error or a
 
 **Acceptance criteria**
 - Every failed step's diagnosis result is one of exactly two values, `NORMAL_ERROR` or `CAPABILITY_GAP`, visible in the step detail.
-- A `NORMAL_ERROR` routes to retry or stop; a `CAPABILITY_GAP` routes to the Capability Engine.
+- A `NORMAL_ERROR` routes to retry (max 3, then FAILED); a `CAPABILITY_GAP` routes to the Capability Engine.
 - At most one diagnosis call is made per failure.
 - If the diagnosis call cannot return a validated response, or exceeds 20 seconds, it fails safe to `NORMAL_ERROR` rather than hanging the workflow.
 
@@ -222,13 +224,13 @@ As a developer, I want to export a summary of a finished run, so that I have a s
 **Acceptance criteria**
 - `GET /api/executions/{id}/report` returns a JSON or Markdown summary containing steps, statuses, diagnosis, capability built, verification score and timings.
 
-### US-15 (LYK)
+### US-15 (promoted to Must — ADR-009)
 As a developer, I want a bad agent endpoint caught when I register it, so that a typo doesn't surface mid-run.
 
-*Could · traces to FR-AGT-011*
+*Must · traces to FR-AGT-011, FR-ADP-010*
 
 **Acceptance criteria**
-- The engine pings the agent's endpoint once at registration.
+- AGEM calls the agent's `GET /health` once at registration.
 - The agent is set `ACTIVE` only if it responds; an unreachable endpoint is rejected with a reason.
 
 ### US-16 (LYK)
@@ -239,6 +241,7 @@ As a developer, I want to connect an MCP server's tools as an agent, so that AGE
 **Acceptance criteria**
 - `mcp_adapter.py` implements the same `base_adapter.py` contract as every other adapter.
 - Adding it requires one new file in `adapters/` and no change to `orchestrator/` — the same proof US-03 already asserts.
+- Only the HTTP (streamable HTTP) transport is accepted; `stdio` is rejected, because it would launch agent code on AGEM's machine (ADR-009).
 
 ### US-17 (LYK)
 As a developer, I want an agent to declare what it can already do, so that obvious cases are resolved without spending an LLM call.
@@ -289,7 +292,7 @@ As an operator, I want live updates to feel instant, so that the recovery sequen
 ## Illustrative Scenarios
 
 ### Single-Agent Workflow
-Example: "Extract tables from this PDF and summarize them." — one PDF-analysis agent is imported and deployed.
+Example: "Extract tables from this PDF and summarize them." — one PDF-analysis agent is registered by its endpoint and deployed.
 
 Flow: User task → AGEM → Agent → Execute → Success? → Final result. On failure, AGEM diagnoses the step; if a capability is missing, the Capability Engine builds/verifies it and the same agent resumes.
 

@@ -303,15 +303,19 @@ Semantic HTML elements over generic divs, visible keyboard focus states, labelle
 | Orchestrator | `orchestrator/orchestrator.py` | Executes steps, DAG, state; the primary running service |
 | Step Executor | `orchestrator/step_executor.py` | Calls agent adapters; normalises every error into one shape |
 | Checkpoint Manager | `orchestrator/checkpoint_manager.py` | Save/load step state |
-| Master Agent | `orchestrator/master_agent.py` | LLM-based failure diagnosis, called by the Orchestrator on failure |
+| Master Agent | `orchestrator/master_agent.py` | Failure diagnosis — rules first, one LLM call only for unmatched errors (ADR-008); called by the Orchestrator on failure |
+
+The Orchestrator does not plan: the user defines the workflow, and the Orchestrator only executes that already-validated DAG. A plain-language walkthrough of this layer, with pseudocode, is in `docs/final_flow.md` §3.
 
 ### 11.2 Scheduler algorithm
 
 ```
 run_execution(execution_id):
-    load the workflow snapshot (step_order fixed at creation time)
-    for each step in step_order:
-        sibling steps with no dependency between them run under asyncio.gather
+    load the workflow snapshot (step_order fixed at creation time; never re-sorted)
+    repeat until every step is SUCCEEDED or one is FAILED:
+        READY steps = PENDING steps whose depends_on are all SUCCEEDED
+        READY siblings run together under asyncio.gather
+          (build the plain sequential version first, then add gather)
 
         run_step(step):
             call the agent via its adapter: execute(input) -> output
@@ -322,9 +326,11 @@ run_execution(execution_id):
             on failure:
                 write checkpoint (paused); mark step PAUSED
                 diagnose_failure(step_id, error) -> NORMAL_ERROR | CAPABILITY_GAP
-                NORMAL_ERROR  -> retry or stop the step, then continue
+                    rules on error_type first; LLM only if no rule matches (ADR-008)
+                NORMAL_ERROR  -> retry the step (max 3); still failing -> mark step FAILED
                 CAPABILITY_GAP -> CapabilityEngine.resolve_gap(capability_name, context)
-                    found/built/verified -> grant capability, resume exact step
+                    reused/found/built + verified -> run tool in sandbox,
+                        resume exact step with context.tool_results
                     exhausted (3 attempts) -> mark step FAILED
 
     Execution.status rolls up from its steps:
@@ -337,7 +343,7 @@ run_execution(execution_id):
 Current step, prior successful outputs, pending inputs, workflow state and recovery information — stored as JSONB and read by the next step's input instead of recomputing an upstream step. The checkpoint is written when a step succeeds and again at the moment a step pauses, never only at the end of a workflow.
 
 ### 11.4 LLM usage inside Orchestration
-`master_agent.py` is the single place where an LLM influences control flow. It requests a JSON response constrained to a fixed Pydantic schema; on parse/validation failure it retries the same call up to 2 times with the validation error appended to the prompt; after that, it fails safe to `NORMAL_ERROR` rather than proceeding on an unvalidated response. Diagnosis uses a cheaper model tier than capability generation, since it is a short structured-output classification prompt.
+`master_agent.py` is the single place where an LLM influences control flow. Diagnosis is two-stage (ADR-008): explicit error types are classified first by deterministic rules — `MISSING_CAPABILITY` → `CAPABILITY_GAP`; `TIMEOUT`, `CONNECTION_ERROR`, `HTTP_5XX`, `INVALID_JSON` → `NORMAL_ERROR` — and only unmatched errors reach the LLM, so a failure costs at most one LLM call and often none. The LLM call requests a JSON response constrained to a fixed Pydantic schema; on parse/validation failure it retries the same call up to 2 times with the validation error appended to the prompt; after that, it fails safe to `NORMAL_ERROR` rather than proceeding on an unvalidated response. Diagnosis uses a cheaper model tier than capability generation, since it is a short structured-output classification prompt.
 
 ### 11.5 Step state — design pattern note
 `ExecutionStep.status` is a plain enum plus one `can_transition(old, new)` function. This is an explicit rejection of a formal State-design-pattern class hierarchy — with five states, that would be over-engineering that costs more time than it saves for this team.
@@ -365,16 +371,19 @@ These are concrete controls, not aspirations — each maps to a specific setting
 
 ```mermaid
 flowchart LR
-    F[Step fails] --> D{diagnose_failure}
-    D -->|NORMAL_ERROR| R[Retry / stop step, continue]
-    D -->|CAPABILITY_GAP| S[Searcher: free / accessible tool?]
-    S -->|found| P[Add tool to workflow, resume paused step]
+    F[Step fails] --> D{diagnose_failure: rules first, LLM if unmatched}
+    D -->|NORMAL_ERROR| R[Retry step, max 3, then FAILED]
+    D -->|CAPABILITY_GAP| RC[Registry: VERIFIED match?]
+    RC -->|yes| RESUME
+    RC -->|no| S[Searcher: free / accessible tool?]
+    S -->|found| IC[Static import check]
     S -->|not found| B[Builder: LLM generates Python source]
-    B --> SB[Sandbox: fresh container, no network, 10s timeout]
+    B --> IC
+    IC --> SB[Sandbox: fresh container, no network, 10s timeout]
     SB --> T[Tester: run against 3 sample inputs]
     T --> V[Verifier: output type / range check]
     V -->|pass| REG[Registry: register capability]
-    REG --> RESUME[Grant to agent, resume exact step]
+    REG --> RESUME[Run tool in sandbox, resume exact step with tool_results]
     V -->|fail, attempts less than 3| B
     V -->|fail, 3 attempts exhausted| FAIL[Step FAILED, CAPABILITY_BUILD_FAILED]
 ```
@@ -513,6 +522,21 @@ See §10 for the full endpoint table and error catalogue. Summary of conventions
 - Stateless routers — the API layer never blocks on a running execution; it validates, starts work via `BackgroundTasks`, and returns immediately.
 - Auth: a single `X-API-Key` header checked by one global FastAPI dependency.
 
+### 16.1 Agent contract (AGEM → agent)
+
+Agents are external and reached only over HTTP (P5, ADR-005). Every registered agent answers exactly two calls; the contract is frozen in `docs/api-spec.md`:
+
+```
+GET  {endpoint}/health    → 200 OK      (called once at registration; failure rejects the agent)
+
+POST {endpoint}/execute
+  request:  { "task": "...", "input": {...}, "context": {...} }
+  success:  { "status": "SUCCEEDED", "output": {...} }
+  failure:  { "status": "FAILED", "error": "MISSING_CAPABILITY", "capability": "..." }
+```
+
+`context.tool_results` carries the result of a verified capability when a paused step resumes (ADR-008). Agents that exist only as code are exposed through a wrapper template in `agent_wrappers/` — a small FastAPI file that imports the developer's agent in *their* process, never in AGEM's. `framework` is one of `rest`, `langchain` or `crewai` (whichever framework adapter is built), and `mcp` only if FR-ADP-009 is built; a plain Python agent registers as `rest` behind `python_wrapper.py`.
+
 ---
 
 ## 17. Key Flows
@@ -564,7 +588,7 @@ sequenceDiagram
 9. If the step succeeds → move to the next step → repeat until done → final result.
 10. If the step fails → pause only that step and preserve a checkpoint.
 11. The Master Agent logic diagnoses what went wrong.
-12. If it's a normal error → retry or stop the step, then continue.
+12. If it's a normal error → retry the step (max 3), then continue; if it still fails, mark it FAILED.
 13. If it's a capability gap → check for a free/accessible tool first; if not found, invoke the Capability Engine: build/acquire → sandbox → test → verify → loop on failure, register on success.
 14. Resume exactly the interrupted step (not the whole workflow).
 15. Continue the rest of the task.
@@ -656,18 +680,19 @@ The only real variable cost in AGEM's MVP is LLM API calls, made from exactly tw
 ## 23. Error Handling Model
 
 ### 23.1 Runtime error normalization
-Every step execution is wrapped in try/except inside `step_executor.py`. Any exception or structured agent error is normalized into one internal shape — `{"status": "FAILED", "error_type": "...", "raw_error": "..."}` — before being handed to `master_agent.py`. This single-shape normalization is what makes diagnosis reliable.
+Every step execution is wrapped in try/except inside `step_executor.py`. Any exception or structured agent error is normalized into one internal shape — `{"status": "FAILED", "error_type": "...", "raw_error": "..."}` — before being handed to `master_agent.py`. `error_type` is always one of `MISSING_CAPABILITY`, `TIMEOUT`, `CONNECTION_ERROR`, `HTTP_5XX`, `INVALID_JSON`, or the fallback `AGENT_ERROR`; the diagnosis rules (ADR-008) match on these exact strings. When the agent names the missing tool, an extra `capability` field carries that name to the Capability Engine. This single-shape normalization is what makes diagnosis reliable.
 
 ### 23.2 Failure & recovery summary
 
 | Situation | What happens |
 |---|---|
 | Step succeeds | Orchestrator moves to the next step normally |
-| Step fails — normal error | Only that step pauses; retry or stop, then continue — no rebuilding needed |
-| Step fails — capability gap, free tool exists | Tool is added into the workflow; the paused step resumes |
-| Step fails — capability gap, no free tool | Capability Engine builds/acquires → sandbox → test → verify |
+| Step fails — normal error | Only that step pauses; retried up to 3 times, then marked `FAILED` — no rebuilding needed |
+| Step fails — capability gap, already in registry | The `VERIFIED` capability is reused; the paused step resumes |
+| Step fails — capability gap, free tool exists | Tool goes through static check → sandbox → test → verify, then the paused step resumes |
+| Step fails — capability gap, no free tool | Capability Engine builds → static check → sandbox → test → verify |
 | Verification fails | Improve/rebuild the capability and test again, bounded by the retry limit |
-| Verification passes | Capability is registered, given to the agent, and the exact step resumes |
+| Verification passes | Capability is registered, run in the sandbox, and its result is passed to the exact step as it resumes |
 
 The whole workflow is never restarted from scratch — only the failed step is ever re-run.
 
@@ -714,8 +739,9 @@ agem/
 │   ├── adapters/
 │   │   ├── base_adapter.py     common interface (abstract class)
 │   │   ├── rest_adapter.py     for REST/API agents
-│   │   ├── langchain_adapter.py
-│   │   └── crewai_adapter.py
+│   │   ├── langchain_adapter.py   one of these two is built (Week 7)
+│   │   ├── crewai_adapter.py
+│   │   └── mcp_adapter.py      stretch only (FR-ADP-009), HTTP transport only
 │   │
 │   ├── capability_engine/
 │   │   ├── engine.py       main capability gap resolution flow
@@ -737,13 +763,21 @@ agem/
 │   ├── runner.py           executes untrusted code safely
 │   └── requirements.txt    only stdlib + very limited packages
 │
+├── agent_wrappers/         turn a code-only agent into an HTTP agent (runs in the developer's process)
+│   ├── python_wrapper.py      Week 3
+│   └── langchain_wrapper.py or crewai_wrapper.py   Week 7 (matches the adapter built)
+│
+├── demo_agents/            Research · Finance · Fact Checker · Writer — each wrapped, own container (ports 9001–9004)
+│
 ├── database/
 │   └── init.sql            base schema if needed outside migrations
 │
 ├── docs/
 │   ├── architecture.md
 │   ├── api-spec.md
-│   ├── adr/                ADR-001-separate-sandbox.md · ADR-002-orchestrator-master-agent.md
+│   ├── adr/                ADR-001-separate-sandbox.md · ADR-002-orchestrator-master-agent.md · ADR-008-rules-first-diagnosis.md · ADR-009-agent-registration-over-http.md
+│   ├── final_flow.md          plain-language guide to the whole flow, Bring → Complete
+│   ├── failure_diagnosis.md   plain-language guide to diagnosis and recovery
 │   └── demo-script.md
 │
 └── scripts/
@@ -788,7 +822,7 @@ Import 4–5 agents → recognize them → create workflow → deploy → start 
 
 ### 28.2 Illustrative scenarios
 
-**Single-Agent Workflow** — e.g. "Extract tables from this PDF and summarize them." One PDF-analysis agent is imported and deployed. Flow: User task → AGEM → Agent → Execute → Success? → Final result. On failure, AGEM diagnoses the step; if a capability is missing, the Capability Engine builds/verifies it and the same agent resumes.
+**Single-Agent Workflow** — e.g. "Extract tables from this PDF and summarize them." One PDF-analysis agent is registered by its endpoint and deployed. Flow: User task → AGEM → Agent → Execute → Success? → Final result. On failure, AGEM diagnoses the step; if a capability is missing, the Capability Engine builds/verifies it and the same agent resumes.
 
 **Multi-Agent Workflow** — e.g. "Create a market research report." Web Research, Competitor Analysis, Data Analysis, Quality Checker, Report Writer agents. Flow: Research → Competitor/Data analysis (parallel where possible) → Quality Check → Writer → Final Report. Agents stay independently built components; AGEM only supplies the coordination layer.
 
@@ -858,6 +892,12 @@ Decision: register every verified capability in a shared capability registry. Ra
 **ADR-007 — Lightweight Custom Orchestrator Instead of LangGraph for MVP**
 Decision: build a custom, lightweight Python orchestrator for the MVP rather than adopting LangGraph, LangChain, RAG, vector databases, or Celery/Redis up front. Rationale: none of these are core to what AGEM does at MVP scale, and each adds dependency and learning-curve overhead a 2-person, 12-week team cannot absorb without risking the core deliverable.
 
+**ADR-008 — Rules-First Diagnosis; Tool Results Passed to Remote Agents**
+Decision: (1) `diagnose_failure()` classifies explicit `error_type` codes by deterministic rules and calls the LLM only for unmatched errors; (2) because agents are external and reached over HTTP, a verified capability is not shipped to the agent as code — AGEM runs it in the sandbox and resumes the paused step with the result in `context.tool_results`; (3) the Capability Engine checks the registry before searching, and a searched tool is verified exactly like a built one. Rationale: most failures skip the LLM, so diagnosis is faster, cheaper and deterministic; the demo's `MISSING_CAPABILITY` path never depends on LLM judgement; the "agent code unchanged" promise holds; and no unverified code is ever trusted. Full explanation in `docs/failure_diagnosis.md`.
+
+**ADR-009 — Agents Registered by HTTP Endpoint; Wrapper Templates; MCP over HTTP Only**
+Decision: (1) every agent is registered by endpoint and must answer `GET /health` and `POST /execute` (§16.1); `/health` is checked at registration; (2) agents that exist only as code are exposed through a wrapper template in `agent_wrappers/`, never imported into AGEM; (3) `framework` is `rest`, `langchain` or `crewai` (the one built) — `python` is dropped because a Python agent is simply a `rest` agent behind `python_wrapper.py`; (4) an MCP adapter is a Week 8 stretch, HTTP (streamable HTTP) transport only — `stdio` is forbidden because it would launch agent code on AGEM's machine. Rationale: keeps the one trust boundary (P4) intact, avoids dependency clashes between agents, needs no per-agent image build, and keeps the agent's own code unchanged (US-01). Full explanation in `docs/final_flow.md` §1.
+
 ---
 
 ## 32. Risks
@@ -887,4 +927,4 @@ Rating scale: Probability is High (expected during the 12 weeks), Medium (likely
 ### 33.2 Still open
 - Which specific framework adapter to build — LangChain or CrewAI — is left as "either" in the master documentation.
 - Whether Redis/Celery is added at all depends on whether the async job queue becomes a real pain point by Week 8; the default is not to add it.
-- Deeper framework adapters and MCP support are named as possible later additions, with no commitment for this build.
+- Deeper framework adapters are named as possible later additions, with no commitment for this build. MCP is a Week 8 stretch only (FR-ADP-009, ADR-009): HTTP transport only, never stdio.
