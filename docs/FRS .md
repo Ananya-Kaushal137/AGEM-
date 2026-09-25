@@ -39,7 +39,9 @@ This document defines **what AGEM must do**: every functional requirement, the q
 | Master Agent | The supervisory/diagnostic role — classifies a failure as `NORMAL_ERROR` or `CAPABILITY_GAP`. Implemented as `diagnose_failure()` inside the Orchestrator service for the MVP (ADR-001), documented as a separate concept |
 | Capability | A specific skill or tool an agent needs but might not have (e.g. "calculate compound interest") |
 | Tool | The actual implementation of a capability — a Python function or a configured API call |
-| Capability Engine | The system that resolves a capability gap: search → build/acquire → sandbox → test → verify → register |
+| Capability Engine | The system that resolves a capability gap: research → build/acquire → sandbox → test → verify → register |
+| Web Research Agent | AGEM's own system agent that searches the web for a missing capability: free tool (if any), formula, worked examples, sources |
+| Output drift | A resumed step's output no longer fitting the next step's `input_mapping` (missing field or wrong type) |
 | Sandbox | An isolated Docker container (`sandbox_runner/`) where untrusted generated code runs, with no network access and resource limits |
 | Verifier | The check that a generated tool's output is correct/safe for the real task, not just that it ran without crashing |
 | Registry | The database table of verified capabilities, so they are reused instead of rebuilt |
@@ -207,29 +209,33 @@ Each requirement has an ID, priority and acceptance criteria (AC). Sections are 
 
 | ID | Requirement | Pri | Acceptance criteria |
 |---|---|---|---|
-| FR-CAP-001 | Pipeline orchestration | M | `engine.py` runs the stages (registry check → free-tool search → build → static import check → sandbox → test → verify → register) as a simple ordered list of functions — not a class-per-handler hierarchy |
-| FR-CAP-002 | Free-tool search before build | M | `Searcher.find_free_tool(capability_name) -> Tool \| None` always runs before the build path (ADR-003), and after the registry check (FR-CAP-016) |
-| FR-CAP-003 | Search is a hardcoded check | M (simplified, disclosed) | The MVP search is a hardcoded web-search check, not a general tool-discovery system — the weakest link in the pipeline, documented as such rather than hidden |
+| FR-CAP-001 | Pipeline orchestration | M | `engine.py` runs the stages (registry check → web research → build → static import check → sandbox → test → verify → register) as a simple ordered list of functions — not a class-per-handler hierarchy |
+| FR-CAP-002 | Web research before build | M | `Searcher.research(capability_name, context) -> ResearchNotes` always runs before the build path (ADR-003), and after the registry check (FR-CAP-016). It calls the Web Research Agent (FR-CAP-024) and returns a free tool if one exists, the formula/definition, worked examples and sources |
+| FR-CAP-003 | Research is bounded and never blocks | M | One research call per gap, 30 s timeout. A timeout, error or empty notes means the engine continues to build without notes. Web text is treated as data, never as instructions. Notes are stored with the capability so a gap is never researched twice. Still not a general tool-discovery system or marketplace (disclosed) |
 | FR-CAP-004 | Found → verify, then resume | M | If a free tool covers the gap, the build step is skipped, but the tool still goes through static import check → sandbox → test → verify before it is registered and used (ADR-004) |
-| FR-CAP-005 | Code generation | M | `Builder.build(capability_name, spec) -> str` returns Python source and never executes it |
+| FR-CAP-005 | Code generation | M | `Builder.build(capability_name, spec, notes, feedback) -> str` returns Python source and never executes it; the research notes' definition is included in the prompt |
 | FR-CAP-006 | Static import check | M | Generated code is scanned for disallowed imports (`os.system`, `subprocess`, `socket`, `open` outside a scratch dir) before it is ever sent to the sandbox |
 | FR-CAP-007 | Sandboxed execution | M | `Sandbox.run(code, inputs) -> SandboxResult` (see §3.8 SBX) |
-| FR-CAP-008 | Testing | M | `Tester.test(code, samples) -> TestResult` runs the tool against **3 sample inputs** |
-| FR-CAP-009 | Verification | M | `Verifier.verify(result, expected_type, expected_range) -> float` returns the `verification_score` stored on the Capability row |
-| FR-CAP-010 | Verification scope | M (simplified, disclosed) | Verification checks output type and range for the kind of input the failed step needs — not full formal verification against all future inputs |
-| FR-CAP-011 | Repair loop | M | On verification failure the engine improves/rebuilds and re-tests rather than discarding the attempt outright |
+| FR-CAP-008 | Testing | M | `Tester.test(code, cases, runs=3) -> TestResult` runs the tool against **about 10 cases** — reference cases with known answers (from research notes or hand-written), edge cases and property checks — each **3 times**, in one sandbox run |
+| FR-CAP-009 | Verification | M | `Verifier.verify(result, previous) -> Verification` measures **accuracy** (passed / total), **regression** (cases that passed in an earlier round and now fail) and **consistency** (same result over 3 runs). Passes only at accuracy ≥ 90%, 0 regressions, all cases consistent. Accuracy is the `verification_score` stored on the Capability row (ADR-010) |
+| FR-CAP-010 | Verification scope | M (simplified, disclosed) | Verification proves correctness on the test cases only — not full formal verification against all future inputs. Reported as "verified on N cases", never as "100% accurate" |
+| FR-CAP-011 | Repair loop (refine until verified) | M | On verification failure the failing cases (input, returned value, expected value) are fed into the next build prompt, and the tool is rebuilt and re-tested. The LLM itself is never fine-tuned (ADR-010) |
 | FR-CAP-012 | Hard attempt cap | M | `resolve_gap()` returns `None` after **3 build/repair attempts**; the step is marked `FAILED` and `CAPABILITY_BUILD_FAILED` (500) is surfaced |
 | FR-CAP-013 | Registration | M | `Registry.register(name, version, code, score) -> Capability` writes to the PostgreSQL capability table |
 | FR-CAP-014 | Capability status lifecycle | M | `BUILDING / VERIFIED / FAILED`; only `VERIFIED` rows are ever handed to an agent or reused; `FAILED` rows are kept for the audit trail, never deleted |
 | FR-CAP-015 | Grant and resume | M | Agents are remote, so AGEM runs the verified tool in the sandbox with the paused step's input and resumes the exact paused step with the result in `context.tool_results` (ADR-008). An `AgentCapability` row records the grant |
 | FR-CAP-016 | Registry check first / reuse | M | The registry is checked **first**, before search; a `VERIFIED` match is reused and the pipeline skips straight to resume, so a second agent hitting the same gap never rebuilds it (ADR-006) |
-| FR-CAP-017 | Timing budget | M | Build → sandbox → test → verify completes in **< 60 s end-to-end**, including at most one repair loop |
-| FR-CAP-018 | Generation evaluation | S | 5 canned gaps (the demo calculator plus four others) scored as the proportion reaching `VERIFIED` within the 3-attempt cap |
+| FR-CAP-017 | Timing budget | M | Build → sandbox → test → verify completes in **< 90 s end-to-end**, including up to 3 refinement rounds; web research adds at most 30 s |
+| FR-CAP-018 | Generation evaluation | S | 5 canned gaps (the demo calculator plus four others) scored as the proportion reaching `VERIFIED` (accuracy ≥ 90%, 0 regression, consistent) within the 3-round cap |
 | FR-CAP-019 | Reliable demo trigger | M | `scripts/trigger_capability_gap.py` reproducibly forces a capability gap so the search → build → sandbox → test → resume sequence can be demonstrated on demand |
-| FR-CAP-020 (LYK) | Generated code viewer | S | The Capabilities page can open a detail view showing the stored source code, the verification score, the 3 test inputs and the pass/fail result per input |
+| FR-CAP-020 (LYK) | Generated code viewer | S | The Capabilities page can open a detail view showing the stored source code, the verification score, the test cases and the pass/fail result per case, and the research sources |
 | FR-CAP-021 (LYK) | Failed-attempt history | S | All 3 build attempts for a gap (code + failure reason) are stored, not only the final state, and are viewable in the capability detail view |
 | FR-CAP-022 (LYK) | Human-in-the-loop approval gate | C | A capability can optionally require user approval before being granted to an agent; the step enters an `APPROVAL_PENDING` sub-state and a narrowly-scoped approval endpoint (distinct from the general resume endpoint forbidden by FR-CKP-007) accepts approve/reject |
-| FR-CAP-023 (LYK) | MCP tool lookup | C | `searcher.py` additionally looks up the missing capability on a small configured list of MCP tool servers (HTTP transport only) before the build path; a match still goes through FR-CAP-004's checks. Turns the hardcoded "acquire" check into a real mechanism |
+| FR-CAP-023 (LYK) | MCP tool lookup | C | `searcher.py` additionally looks up the missing capability on a small configured list of MCP tool servers (HTTP transport only) before the build path; a match still goes through FR-CAP-004's checks |
+| FR-CAP-024 | Web Research Agent | M | A system agent in `research_agent/`, own container (port 9005), answering the standard `GET /health` + `POST /execute` contract; called through the REST adapter; searches the web and summarises into research notes `{free_tool, definition, examples, sources}`. It never installs or runs found code; the sandbox keeps no network (ADR-011) |
+| FR-CAP-025 | Research notes as reference cases | M | Worked examples from the research notes become reference test cases for FR-CAP-008, so expected answers do not come from the LLM whose code is tested |
+| FR-CAP-026 | Output drift check | M | After a resumed step finishes, `check_output_drift(output, downstream_steps)` verifies every field in the downstream steps' `input_mapping` is present with the right type. Pass → `SUCCEEDED`; fail → step `FAILED` with `OUTPUT_DRIFT` and the downstream step never runs (ADR-010) |
+| FR-CAP-027 | Demo research fallback | M | Research notes for the demo capability are saved in advance and used if the web is slow or unavailable, so the demo never depends on the internet |
 
 ### 3.8 Sandbox & Code Safety (SBX) — Week 6
 
@@ -275,7 +281,7 @@ Each requirement has an ID, priority and acceptance criteria (AC). Sections are 
 | FR-API-001 | Endpoint set | M | 4 routers — `agents.py`, `workflows.py`, `executions.py`, `capabilities.py` — covering the full endpoint list, documented verbatim in `docs/api-spec.md` |
 | FR-API-002 | Strict request validation | M | Pydantic schemas in `app/schemas/` use `extra = "forbid"` so unknown fields are rejected, not silently ignored |
 | FR-API-003 | Single error envelope | M | Every 4xx/5xx response uses `{"error_code": "...", "message": "...", "details": {...}}` |
-| FR-API-004 | Error code catalogue | M | `VALIDATION_ERROR` (422), `*_NOT_FOUND` (404), `WORKFLOW_CYCLE_DETECTED` (400), `UNAUTHORIZED` (401), `CAPABILITY_BUILD_FAILED` (500) |
+| FR-API-004 | Error code catalogue | M | `VALIDATION_ERROR` (422), `*_NOT_FOUND` (404), `WORKFLOW_CYCLE_DETECTED` (400), `UNAUTHORIZED` (401), `CAPABILITY_BUILD_FAILED` (500), `OUTPUT_DRIFT` (500) |
 | FR-API-005 | Stateless, non-blocking | M | The API layer holds no execution state, validates the request, starts work and returns immediately |
 | FR-API-006 | Step detail endpoint | M | `GET /api/executions/{id}/steps/{step_id}` includes error, diagnosis result and checkpoint reference |
 | FR-API-007 (LYK) | Execution report export | S | `GET /api/executions/{id}/report` returns a JSON or Markdown summary of steps, statuses, diagnosis, capability built, verification score and timings for a completed run |
@@ -304,6 +310,7 @@ Each requirement has an ID, priority and acceptance criteria (AC). Sections are 
 | FR-DAT-006 | Alembic migrations | M | After the first migration exists, all schema changes go through Alembic — no manual edits to `database/init.sql` |
 | FR-DAT-007 | Thin repository CRUD | M | A small set of plain CRUD functions per model, not a generic repository abstraction layer |
 | FR-DAT-008 | DB as single source of truth | M | No execution state lives only in memory |
+| FR-DAT-009 | Research notes and test cases stored | M | `Capability` gains `research_notes` (JSONB) and `test_cases` (JSONB) through a new Alembic migration; the first migration is never edited (FR-CAP-003, FR-CAP-025) |
 
 ### 3.13 Observability & Audit Trail (OBS) — ongoing, Week 11
 
@@ -340,7 +347,7 @@ Each requirement has an ID, priority and acceptance criteria (AC). Sections are 
 | NFR-PERF-01 | Performance | Orchestrator overhead adds < 300 ms per step, excluding agent/LLM call time |
 | NFR-PERF-02 | Performance | Dashboard/Executions refresh interval is a 3-second poll |
 | NFR-PERF-03 | Performance | Master Agent diagnosis LLM call: < 8 s typical, treated as a timeout at 20 s |
-| NFR-PERF-04 | Performance | Capability build → sandbox → test → verify loop: < 60 s end-to-end, including at most one repair loop |
+| NFR-PERF-04 | Performance | Capability build → sandbox → test → verify loop: < 90 s end-to-end, including up to 3 refinement rounds; web research ≤ 30 s |
 | NFR-PERF-05 | Performance | Supports 1–5 simultaneous workflow runs |
 | NFR-SEC-01 | Security | Untrusted (imported or generated) code never executes directly on the main AGEM server — isolation is the non-negotiable foundation of the safety claim |
 | NFR-SEC-02 | Security | Sandbox isolation is enforced by literal Docker flags: `--network none`, an execution timeout, `--memory=256m --cpus=0.5` |
@@ -351,7 +358,7 @@ Each requirement has an ID, priority and acceptance criteria (AC). Sections are 
 | NFR-REL-02 | Reliability | Every step transition and checkpoint is written before the next step starts, so a backend restart mid-run leaves a recoverable, inspectable state instead of a lost one |
 | NFR-AUDIT-01 | Auditability | Execution history, errors, recovery events, capability acquisition/build history and verification results are all recorded as outputs |
 | NFR-ACC-01 | Accessibility | Semantic HTML, visible keyboard focus states, labelled form inputs, status badges pairing colour with text/icon — a deliberate baseline, not a full WCAG audit |
-| NFR-COST-01 | Cost | At most 1 diagnosis call per failure and at most 3 build/repair attempts per capability gap |
+| NFR-COST-01 | Cost | At most 1 diagnosis call per failure, at most 1 web research call per capability gap, and at most 3 build/repair attempts per capability gap |
 | NFR-COST-02 | Cost | A cheaper model tier is used for diagnosis; the stronger model is reserved for code generation |
 | NFR-COST-03 | Cost | No GPU or local model hosting; no cloud infrastructure bill — PostgreSQL, Docker and the sandbox all run locally via docker-compose |
 | NFR-AVAIL-01 | Availability | Not applicable — a local/self-hosted demo deployment, not a hosted service with an SLA |
@@ -372,7 +379,7 @@ Each requirement has an ID, priority and acceptance criteria (AC). Sections are 
 | BR-06 | The DAG is validated at creation, not at execution — an invalid workflow can never reach the Orchestrator |
 | BR-07 | Resume is always an internal consequence of a successful diagnosis or a verified capability — never a user-triggered action (no public resume endpoint) |
 | BR-08 | Every verified capability is registered in the shared capability registry so future gaps of the same kind are reused, not rebuilt (ADR-006) |
-| BR-09 | Every loop and every retry in the system is bounded — one diagnosis call per failure, three build attempts per gap, a sandbox timeout, CPU/memory caps |
+| BR-09 | Every loop and every retry in the system is bounded — one diagnosis call per failure, one research call per gap, three build attempts per gap, a sandbox timeout, CPU/memory caps |
 | BR-10 | A `FAILED` capability row is kept, never deleted, for the audit trail |
 | BR-11 | An `INACTIVE` agent cannot be added to a new workflow, but executions that already reference it still resolve |
 | BR-12 | Framework-specific knowledge lives only inside `adapters/`; supporting a new framework never requires changing `orchestrator/` |
@@ -405,7 +412,7 @@ Each requirement has an ID, priority and acceptance criteria (AC). Sections are 
 | UC-03 | Run a single-agent workflow | Developer | Valid workflow | Start execution → agent executes → step succeeds → final result shown | Step fails → diagnosis begins |
 | UC-04 | Run a multi-agent workflow | Developer | Valid multi-step workflow | Research → parallel analysis → Quality Check → Writer → final report | One branch fails → only that step pauses |
 | UC-05 | Recover from a normal error | Developer | Step failed | Diagnosis classifies `NORMAL_ERROR` → step retries or stops → workflow continues | Retries exhausted → step `FAILED` |
-| UC-06 | Recover from a capability gap (end-to-end) | Developer | Step failed with `MISSING_CAPABILITY` | Diagnosis classifies `CAPABILITY_GAP` → free-tool search (not found) → Capability Engine builds → sandbox → test → verify → register → resume exact step → final result | Verification fails → repair loop, bounded at 3 attempts |
+| UC-06 | Recover from a capability gap (end-to-end) | Developer | Step failed with `MISSING_CAPABILITY` | Diagnosis classifies `CAPABILITY_GAP` → Web Research Agent (no free tool; returns formula + worked examples) → Capability Engine builds from the notes → sandbox → test → verify (accuracy ≥ 90%, 0 regression, consistent) → register → resume exact step → output drift check → final result | Verification fails → failing cases fed back, rebuilt, bounded at 3 rounds; research fails → build without notes; drift → step `FAILED` (`OUTPUT_DRIFT`) |
 | UC-07 | Reuse a verified capability | Developer | Capability already registered | A second agent hits the same gap → registry match found → capability granted without rebuilding | — |
 | UC-08 | Monitor a live execution | Operator / Examiner | Execution running | Open Executions page → watch step states and recovery sub-stage update every 3 s | Capability gap in progress → distinct node state shown |
 | UC-09 | Inspect a capability | Developer / Examiner | ≥1 capability registered | Open Capabilities page → view name, version, `verification_score`, source | Open the code viewer to read the generated source and test results (FR-CAP-020) |
@@ -429,12 +436,12 @@ Each requirement has an ID, priority and acceptance criteria (AC). Sections are 
 
 - **`test_adapters.py`** — a REST agent returns a valid response; a REST agent times out; an agent returns malformed JSON and is normalised into the standard error shape.
 - **`test_orchestrator.py`** — a 2-step workflow runs in declared order; a cyclic definition is rejected at creation with `WORKFLOW_CYCLE_DETECTED`; a failed step pauses without re-running upstream steps; a resumed step reads its input from the checkpoint rather than recomputing it; each diagnosis rule `error_type` (FR-DIAG-014) maps to the right outcome and the mocked LLM wrapper is not called when a rule matches.
-- **`test_capability_engine.py`** — a gap already `VERIFIED` in the registry skips search and build; a gap where a free tool exists skips the build but still runs static check, sandbox, test and verify; a gap with no free tool builds, tests, verifies and registers; a capability that fails verification three times marks the step `FAILED` instead of looping.
+- **`test_capability_engine.py`** — a gap already `VERIFIED` in the registry skips search and build; a gap where a free tool exists skips the build but still runs static check, sandbox, test and verify; a gap with no free tool builds, tests, verifies and registers; a capability that fails verification three times marks the step `FAILED` instead of looping; a repair round receives the previous round's failing cases; a tool below 90% accuracy, with a regression, or with inconsistent results is not registered; a research timeout still reaches the build stage; a resumed step whose output misses a downstream `input_mapping` field is marked `FAILED` with `OUTPUT_DRIFT`.
 - **`test_sandbox.py`** — code attempting network access fails; code exceeding the timeout is killed; code exceeding the memory cap is killed; a benign function returns its result correctly.
 
 ### 8.3 LLM output evaluation
 - **Diagnosis:** a fixed, hand-labelled set of 20 error examples (10 genuine capability gaps, 10 normal errors) in `backend/tests/fixtures/`; scored as classification accuracy against those labels, **18/20 pass bar**, re-run whenever the diagnosis prompt changes.
-- **Capability generation:** scored against 5 canned gaps — the calculator gap used in the demo plus four others — as the proportion reaching `VERIFIED` within the 3-attempt cap.
+- **Capability generation:** scored against 5 canned gaps — the calculator gap used in the demo plus four others — as the proportion reaching `VERIFIED` (accuracy ≥ 90%, 0 regression, consistent) within the 3-round cap.
 - LLM calls are mocked in unit tests; real API calls happen only in these two evaluation runs, so CI stays free, fast and deterministic.
 
 ### 8.4 Entry and exit criteria
@@ -488,7 +495,7 @@ Each item is rated pass/fail; all Must-priority items must pass before the Week 
 | 1 | Repo, Docker Compose skeleton | Research diagnosis approaches, design capability flow | Shared repo running | DEP |
 | 2 | DB schema, base FastAPI app | DB schema, capability engine flow on paper | Database running, API starts | DAT, API |
 | 3 | `base_adapter.py` + `rest_adapter.py`, agent registration | `master_agent.py` — basic LLM classification call | One agent registered and callable | AGT, ADP, DIAG |
-| 4 | `orchestrator.py` — sequential DAG (no failure yet) | `searcher.py` — free-tool check | 2-agent workflow runs end-to-end | WFL, ORC, CAP |
+| 4 | `orchestrator.py` — sequential DAG (no failure yet) | `searcher.py` — research client + `research_agent/` | 2-agent workflow runs end-to-end | WFL, ORC, CAP |
 | 5 | `checkpoint_manager.py` | `builder.py` — LLM generates a tool | Workflow pauses and resumes from checkpoint | CKP, CAP |
 | 6 | Wire orchestrator → master_agent on failure | `sandbox_runner/` isolated Docker execution | Failure detected, classified, sandbox runs | ORC, DIAG, SBX |
 | 7 | `langchain_adapter.py` or `crewai_adapter.py` | `tester.py` + `verifier.py` | Full capability gap loop end-to-end | ADP, CAP |

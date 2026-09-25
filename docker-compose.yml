@@ -82,5 +82,18 @@ services:
     cpus: 0.5
     restart: "no"
 
+  # WEB RESEARCH AGENT — AGEM's own system agent (ADR-011, FR-CAP-024).
+  # Searches the web when a capability is missing and returns research notes.
+  # Has internet; runs no found code. The sandbox above keeps --network none.
+  # Uncomment once research_agent/ exists (Prompt 10).
+  # research-agent:
+  #   build: ./research_agent
+  #   container_name: agem-research-agent
+  #   ports:
+  #     - "${RESEARCH_AGENT_PORT:-9005}:9005"
+  #   environment:
+  #     LLM_API_KEY: ${LLM_API_KEY}
+  #     SEARCH_API_KEY: ${SEARCH_API_KEY}
+
 volumes:
   postgres_data:

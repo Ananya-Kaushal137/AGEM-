@@ -1,4 +1,4 @@
-"""Stricter correctness check — output type / range.
+"""Accuracy (>= 90%), regression (0) and consistency checks (ADR-010).
 
-Verifier.verify(result: TestResult, expected_type: type, expected_range: tuple | None) -> float
+Verifier.verify(result: TestResult, previous: TestResult | None) -> Verification
 """

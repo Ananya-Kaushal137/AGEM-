@@ -102,7 +102,7 @@ class AgentFramework(str, Enum):
 class CapabilitySource(str, Enum):
     """`Capability.source` — how the capability was obtained.
 
-    `ACQUIRED` when `Searcher.find_free_tool` covered the gap, `BUILT` when the
+    `ACQUIRED` when a free tool from `Searcher.research` covered the gap, `BUILT` when the
     Builder generated it. Surfaced on the Capabilities page (FR-UI-009).
     """
 

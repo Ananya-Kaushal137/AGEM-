@@ -2,8 +2,8 @@
 
 AGEM orchestrates workflows across agents built in any framework, and when a
 step fails because an agent is *missing a capability*, it diagnoses the gap,
-builds the missing tool, tests it in a sandbox, verifies it, registers it and
-resumes the exact step that failed.
+researches it on the web, builds the missing tool, tests it in a sandbox,
+refines it until it verifies, registers it and resumes the exact step that failed.
 
 See [docs/Architecture.md](docs/Architecture.md) and [docs/FRS .md](docs/FRS%20.md).
 
@@ -24,6 +24,7 @@ That brings up all four services (FR-DEP-001):
 | `backend` | 8000 | FastAPI + Orchestrator + Master Agent + Capability Engine, one process |
 | `postgres` | 5432 | Single source of truth |
 | `sandbox` | — | Minimal image, no network; a fresh container runs per capability test |
+| `research-agent` | 9005 | Web Research Agent — searches the web when a capability is missing (added in Prompt 10) |
 
 Health check: `curl -H "X-API-Key: $API_KEY" http://localhost:8000/health`
 

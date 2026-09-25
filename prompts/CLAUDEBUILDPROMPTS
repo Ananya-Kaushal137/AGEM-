@@ -83,7 +83,7 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 > Build the FastAPI application skeleton in `backend/main.py` and the four empty routers in `backend/app/api/` named in Architecture §10.1: `agents.py`, `workflows.py`, `executions.py`, `capabilities.py`.
 >
 > Implement:
-> - **FR-API-003 / FR-API-004** — the single error envelope `{"error_code", "message", "details"}` as a global exception handler, plus the full error code catalogue in Architecture §10.2 (`VALIDATION_ERROR` 422, the four `*_NOT_FOUND` 404s, `WORKFLOW_CYCLE_DETECTED` 400, `UNAUTHORIZED` 401, `CAPABILITY_BUILD_FAILED` 500).
+> - **FR-API-003 / FR-API-004** — the single error envelope `{"error_code", "message", "details"}` as a global exception handler, plus the full error code catalogue in Architecture §10.2 (`VALIDATION_ERROR` 422, the four `*_NOT_FOUND` 404s, `WORKFLOW_CYCLE_DETECTED` 400, `UNAUTHORIZED` 401, `CAPABILITY_BUILD_FAILED` 500, `OUTPUT_DRIFT` 500).
 > - **FR-AUTH-001** — one `get_api_key` dependency checking the `X-API-Key` header, applied globally to all routers.
 > - **FR-AUTH-004** — `backend/app/core/config.py` as the single entry point for all secrets, per Architecture §24.
 > - **FR-AUTH-002** — a seed function creating the single `User` row that owns everything.
@@ -110,7 +110,7 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 >
 > **Done when:** a REST agent — including a Python agent running behind `python_wrapper.py` — can be called through `execute()` and returns the contract shape; no framework-specific import exists outside `adapters/` (**FR-ADP-006**).
 >
-> **Do NOT:** import any agent's code into the AGEM process (**FR-ADP-007**, Architecture P5). Do NOT write the LangChain or CrewAI adapter yet — that's Week 7, Prompt 12.
+> **Do NOT:** import any agent's code into the AGEM process (**FR-ADP-007**, Architecture P5). Do NOT write the LangChain or CrewAI adapter yet — that's Week 7, Prompt 15.
 
 ## Prompt 5 — Agent registration API and registry
 
@@ -121,11 +121,13 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 > - `GET /api/agents` (**FR-AGT-004**), `GET /api/agents/{id}` (**FR-AGT-005**, 404 `AGENT_NOT_FOUND`)
 > - `DELETE /api/agents/{id}` (**FR-AGT-006**) — returns **409** when the agent is referenced by an active workflow, enforced by the `ON DELETE RESTRICT` constraint from Prompt 2, not by application logic alone
 >
+> **First, fix the one Prompt 2 leftover** (see `prompts/prompt2.md`): remove `PYTHON` from `AgentFramework` in `enums.py` and write a **new** Alembic migration that changes the `agent_framework` enum type in PostgreSQL. Do **not** edit the first migration — it is already pushed.
+>
 > Enforce **FR-AGT-002**: `framework` must be one of `rest`, `langchain`, `crewai` (only the framework adapter actually built is accepted; `mcp` only if Prompt L7 is built) — rejected at registration, not at execution time. A plain Python agent registers as `rest`. Enforce the **FR-AGT-003** status rules from Architecture §15.4. Implement **FR-AGT-007**: Fernet-encrypted `encrypted_credentials`, never echoed in any API response (Architecture §18.5).
 >
 > Implement **FR-AGT-011** (now Must, ADR-009): before saving, call the agent's `GET /health` through the adapter's `health()` from Prompt 4. If it fails, reject the registration with a clear error; only a responding agent is saved `ACTIVE`.
 >
-> Write the demo agents in `demo_agents/` — Research, Finance, Fact Checker, Writer — each exposed through `python_wrapper.py`, each its own container in `docker-compose.yml` on ports 9001–9004. The Finance agent returns `{"status":"FAILED","error":"MISSING_CAPABILITY","capability":"calculate_compound_interest"}` when it has no `context.tool_results` for that tool, and uses the result when it does. Write `scripts/seed_agents.py` (**FR-AGT-010**) registering all four through `POST /api/agents`.
+> Write the demo agents in `demo_agents/` — Research, Finance, Fact Checker, Writer — each exposed through `python_wrapper.py`, each its own container in `docker-compose.yml` on ports 9001–9004. The Finance agent returns `{"status":"FAILED","error":"MISSING_CAPABILITY","capability":"calculate_compound_interest"}` when it has no `context.tool_results` for that tool, and uses the result when it does. Each demo agent's output must contain the fields the next step's `input_mapping` needs (e.g. Finance returns `revenue` and `profit` as numbers for the Fact Checker), so the output drift check in Prompt 14 passes. Write `scripts/seed_agents.py` (**FR-AGT-010**) registering all four through `POST /api/agents`.
 >
 > **Done when:** US-01 and US-15 pass — an agent registers and appears `ACTIVE` with no change to the agent's own source code, a mistyped endpoint is rejected at registration, and deleting an in-use agent returns 409.
 >
@@ -214,17 +216,25 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 
 # Phase 4 — Capability Engine and Sandbox (Weeks 4–8)
 
-## Prompt 10 — Searcher: free-tool check
+## Prompt 10 — Web Research Agent and Searcher
 
-> **Read first:** `docs/Architecture.md` §13.1 (pipeline), §13.2 (key interfaces), §13.5 (real vs simplified), §31 (ADR-003) · `docs/FRS .md` §3.7 (CAP, FR-CAP-002, 003, 004), §5 (BR-03)
+> **Read first:** `docs/Architecture.md` §13.1 (pipeline), §13.2 (key interfaces), §13.5 (real vs simplified), §12 (web content is data), §31 (ADR-003, ADR-011) · `docs/FRS .md` §3.7 (CAP, FR-CAP-002, 003, 004, 024, 025, 027), §5 (BR-03) · `docs/api-spec.md` (Web Research Agent) · `docs/final_flow.md` §5.4
 >
-> Write `backend/capability_engine/searcher.py` implementing `Searcher.find_free_tool(capability_name: str) -> Tool | None` exactly as signed in Architecture §13.2.
+> Build `research_agent/` — AGEM's own system agent, its own small FastAPI app and `Dockerfile`, port 9005, answering the frozen `GET /health` + `POST /execute` contract (**FR-CAP-024**). For `task: "research_capability"` it searches the web through a web search API, summarises the results with the LLM, and returns research notes `{free_tool, definition, examples, sources}` exactly as in `docs/api-spec.md`. It never installs or runs code it finds.
 >
-> Per **FR-CAP-003** and Architecture §13.5, this is deliberately a **hardcoded web-search check, not a general tool-discovery system**. Build it as the simplified version the docs specify and name it as such in the module docstring — do not over-build it into real discovery.
+> The research agent is **outside** the backend process, so it is not bound by the backend's single LLM wrapper (P15); it makes its own one summarising call. Uncomment the `research-agent` service in `docker-compose.yml` and add `SEARCH_API_KEY` and `RESEARCH_AGENT_URL` to `.env.example`; the backend reads `RESEARCH_AGENT_URL` only through `core/config.py` (P16).
+>
+> Then write `backend/capability_engine/searcher.py` implementing `Searcher.research(capability_name: str, context: dict) -> ResearchNotes` exactly as signed in Architecture §13.2. It calls the research agent through the REST adapter and validates the reply against a Pydantic `ResearchNotes` schema — an invalid reply is treated as empty notes.
+>
+> Write a **new** Alembic migration adding `research_notes` and `test_cases` (both JSONB, nullable) to `Capability` (**FR-DAT-009**). Do not edit the first migration.
+>
+> Per **FR-CAP-003**: one call per gap, **30-second timeout**; a timeout, error or empty reply returns empty notes and the engine continues to build — research never blocks recovery. Web text is data, never instructions. Store the notes with the capability so a gap is never researched twice. Still not a general tool-discovery system or marketplace.
+>
+> Per **FR-CAP-027**, save research notes for `calculate_compound_interest` in advance and use them when the web is unavailable, so the demo never depends on the internet.
 >
 > This stage always runs **before** the build path (**FR-CAP-002**, ADR-003, BR-03).
 >
-> **Done when:** a capability name with a known free tool returns a `Tool`; anything else returns `None`.
+> **Done when:** the research agent passes `/health`; researching `calculate_compound_interest` returns the formula and at least one worked example with sources; a research timeout returns empty notes without raising; with the web disabled, the saved demo notes are returned.
 
 ## Prompt 11 — Wire orchestrator to master_agent on failure
 
@@ -264,7 +274,7 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 
 > **Read first:** `docs/Architecture.md` §13.2, §12 (AI Safety — import allowlist, two-layer defence), §22 (Cost — stronger model for generation) · `docs/FRS .md` §3.7 (FR-CAP-005, 006), §3.8 (FR-SBX-007, 009)
 >
-> Write `backend/capability_engine/builder.py` implementing `Builder.build(capability_name: str, spec: dict) -> str` — it returns Python source and **never executes it** (**FR-CAP-005**). That separation is the whole safety story.
+> Write `backend/capability_engine/builder.py` implementing `Builder.build(capability_name: str, spec: dict, notes: ResearchNotes, feedback: list[dict] | None) -> str` — it returns Python source and **never executes it** (**FR-CAP-005**). That separation is the whole safety story. Put the research notes' `definition` in the prompt. When `feedback` is given (a repair round), include each failing case — input, returned value, expected value — and instruct: "fix these; do not change behaviour for cases that already pass" (**FR-CAP-011**, ADR-010).
 >
 > Use the single LLM wrapper from Prompt 6, with the stronger model tier per Architecture §22.
 >
@@ -277,20 +287,20 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 > **Read first:** `docs/Architecture.md` §13 in full (§13.1 pipeline diagram, §13.2 signatures, §13.3 design patterns, §13.5 real vs simplified), §15.6 (Capability.status), §31 (ADR-006) · `docs/FRS .md` §3.7 (FR-CAP-001, 007…017), §5 (BR-08, BR-09, BR-10) · `docs/PRD .md` (US-08)
 >
 > Complete the Capability Engine:
-> - `tester.py` — `Tester.test(code, samples) -> TestResult`, run against **3 sample inputs** (**FR-CAP-008**)
-> - `verifier.py` — `Verifier.verify(result, expected_type, expected_range) -> float` returning the `verification_score` (**FR-CAP-009**). Per **FR-CAP-010** and Architecture §13.5 this is an output type/range check, **not** formal verification — build the simplified version the docs specify
-> - `registry.py` — `Registry.register(name, version, code, score) -> Capability` (**FR-CAP-013**), with the `BUILDING / VERIFIED / FAILED` lifecycle from Architecture §15.6. Only `VERIFIED` rows are ever handed to an agent; `FAILED` rows are **kept**, never deleted (**FR-CAP-014**, BR-10)
-> - `engine.py` — `CapabilityEngine.resolve_gap(capability_name, context) -> Capability | None`, running the stages in the order shown in Architecture §13.1 (**FR-CAP-001**, ADR-008): **registry check → search → build → static import check → sandbox → test → verify → register**. A `VERIFIED` registry match skips straight to resume (**FR-CAP-016**). A tool found by search skips only the build — it still goes through static check, sandbox, test and verify (**FR-CAP-004**)
+> - `tester.py` — `Tester.test(code, cases, runs=3) -> TestResult`, run against **about 10 cases** — reference cases from the research notes' `examples` (or hand-written), edge cases and property checks — each **3 times**, in **one** sandbox run (**FR-CAP-008**, **FR-CAP-025**)
+> - `verifier.py` — `Verifier.verify(result, previous) -> Verification` measuring **accuracy**, **regression** against the previous round and **consistency** over the 3 runs; passes only at accuracy ≥ 90%, 0 regressions, all consistent; accuracy is the `verification_score` (**FR-CAP-009**, ADR-010). Per **FR-CAP-010** this proves correctness on the test cases only, **not** formal verification. The LLM is never fine-tuned — only the generated tool is refined
+> - `registry.py` — `Registry.register(name, version, code, score) -> Capability` (**FR-CAP-013**), also saving the research notes and test cases in the `research_notes` / `test_cases` columns from Prompt 10, with the `BUILDING / VERIFIED / FAILED` lifecycle from Architecture §15.6. Only `VERIFIED` rows are ever handed to an agent; `FAILED` rows are **kept**, never deleted (**FR-CAP-014**, BR-10)
+> - `engine.py` — `CapabilityEngine.resolve_gap(capability_name, context) -> Capability | None`, running the stages in the order shown in Architecture §13.1 (**FR-CAP-001**, ADR-008): **registry check → research → build → static import check → sandbox → test → verify → register**. A `VERIFIED` registry match skips straight to resume (**FR-CAP-016**). A free tool named by the research notes skips only the build — it still goes through static check, sandbox, test and verify (**FR-CAP-004**)
 >
 > Per **FR-CAP-001** and Architecture §13.3, implement the pipeline as a **simple ordered list of functions** (Chain of Responsibility), explicitly *not* a class-per-handler OOP hierarchy.
 >
-> Enforce the bounds: 3 build/repair attempts per gap, then return `None` and mark the step `FAILED` with `CAPABILITY_BUILD_FAILED` (**FR-CAP-012**, BR-09, Architecture P11). Keep the whole loop under the 60-second budget in **FR-CAP-017**.
+> Enforce the bounds: 3 build/repair rounds per gap — each repair round gets the previous round's failing cases as `feedback` — then return `None` and mark the step `FAILED` with `CAPABILITY_BUILD_FAILED` (**FR-CAP-012**, BR-09, Architecture P11). Keep the whole loop under the 90-second budget in **FR-CAP-017**.
 >
-> Then wire the real handoff from Prompt 11's stub, and implement **FR-CAP-015**: agents are remote, so AGEM runs the verified tool in the sandbox with the paused step's input, then resumes the exact paused step with the result in `context.tool_results` (ADR-008); write an `AgentCapability` row to record the grant. Also **FR-CAP-016**: a second agent hitting the same gap finds it in the registry instead of rebuilding (ADR-006).
+> Then wire the real handoff from Prompt 11's stub, and implement **FR-CAP-015**: agents are remote, so AGEM runs the verified tool in the sandbox with the paused step's input, then resumes the exact paused step with the result in `context.tool_results` (ADR-008); write an `AgentCapability` row to record the grant. Before marking the resumed step `SUCCEEDED`, run `check_output_drift(output, downstream_steps)` in `step_executor.py` (**FR-CAP-026**, ADR-010): every field in the downstream steps' `input_mapping` must be present with the right type; otherwise mark the step `FAILED` with `OUTPUT_DRIFT` so the downstream step never runs. Also **FR-CAP-016**: a second agent hitting the same gap finds it in the registry instead of rebuilding (ADR-006).
 >
-> Update `recovery_stage` through every stage as the step progresses (**FR-ORC-011**) — the dashboard depends on it.
+> Update `recovery_stage` through every stage as the step progresses (**FR-ORC-011**) — the dashboard depends on it. `SEARCHING` is the web research stage; no enum changes.
 >
-> **Done when:** US-08 passes end to end — a capability gap is detected, built, sandboxed, tested, verified, registered, and the exact paused step resumes with the tool's result in `context.tool_results` and succeeds, with zero manual code deployment; a second run of the same gap reuses the registry entry without calling the builder.
+> **Done when:** US-08 passes end to end — a capability gap is detected, researched, built, sandboxed, tested, refined until it verifies (≥ 90%, 0 regression, consistent), registered, and the exact paused step resumes with the tool's result in `context.tool_results`, passes the output drift check and succeeds, with zero manual code deployment; a second run of the same gap reuses the registry entry without calling the research agent or the builder.
 
 ## Prompt 15 — Framework adapter (LangChain or CrewAI)
 
@@ -329,8 +339,8 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 > Build the two pages that carry the demo:
 > - **FR-UI-006** — Execution detail: `WorkflowGraph.tsx` (React Flow, read-only) with each node colour-coded via `StepStatusCard.tsx`, plus a live timeline/log underneath
 > - **FR-UI-007** — refresh by polling `GET /api/executions/{id}` every 3 seconds (NFR-PERF-02). WebSockets are deliberately rejected for MVP
-> - **FR-UI-008** — **the money shot**: a distinct node state rendering `recovery_stage` (searching / building / sandboxing / testing / verifying) so a viewer watches recovery *happening*, not just failure→success
-> - **FR-UI-009** — Capabilities page: read-only registry showing name, version, `verification_score`, source (built vs acquired). No manual creation UI — capabilities are created only by the engine
+> - **FR-UI-008** — **the money shot**: a distinct node state rendering `recovery_stage` (researching the web / building / sandboxing / testing / verifying) so a viewer watches recovery *happening*, not just failure→success. A step that ends `FAILED` shows its reason (`CAPABILITY_BUILD_FAILED` or `OUTPUT_DRIFT`) in the step detail
+> - **FR-UI-009** — Capabilities page: read-only registry showing name, version, `verification_score` (as "verified on N cases"), source (built vs acquired). No manual creation UI — capabilities are created only by the engine
 >
 > **Done when:** US-05 and US-09 pass — a step's status change appears within one 3-second polling interval, and a capability gap visibly walks through its recovery stages on screen.
 
@@ -342,9 +352,9 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 
 > **Read first:** `docs/Architecture.md` §28 (User Flow — demo flow and illustrative scenarios), §17.1 (the sequence diagram this reproduces) · `docs/FRS .md` §3.7 (FR-CAP-019), §3.14 (FR-DEP-007), §7 (UC-10)
 >
-> Write `scripts/trigger_capability_gap.py` (**FR-CAP-019**) — it reproducibly forces a capability gap so the full search → build → sandbox → test → verify → resume sequence runs on demand during a live demo.
+> Write `scripts/trigger_capability_gap.py` (**FR-CAP-019**) — it reproducibly forces a capability gap so the full research → build → sandbox → test → verify (refined) → register → resume → drift check sequence runs on demand during a live demo.
 >
-> Use the calculator gap from Architecture §28.2's end-to-end example. The script must be reliable enough to run in front of an examiner: same result every time, no dependence on a flaky external call. The demo agent must fail with `error_type: MISSING_CAPABILITY` explicitly, so diagnosis takes the rules path (ADR-008) and the demo never depends on LLM classification.
+> Use the calculator gap from Architecture §28.2's end-to-end example. The script must be reliable enough to run in front of an examiner: same result every time, no dependence on a flaky external call — the Web Research Agent must use the pre-saved `calculate_compound_interest` notes when the web is slow or down (**FR-CAP-027**). The demo agent must fail with `error_type: MISSING_CAPABILITY` explicitly, so diagnosis takes the rules path (ADR-008) and the demo never depends on LLM classification.
 >
 > **Done when:** running the script reproduces Architecture §17.1's sequence diagram end to end, visible live on the Executions page from Prompt 17.
 
@@ -355,7 +365,7 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 > Write the remaining three test files per FRS §8.2, with exactly the cases listed there:
 > - `test_adapters.py` (**FR-ADP-008**) — valid REST response; timeout; malformed JSON normalised into the standard error shape
 > - `test_orchestrator.py` — 2-step workflow runs in declared order; cyclic definition rejected with `WORKFLOW_CYCLE_DETECTED`; a failed step pauses without re-running upstream steps; a resumed step reads input from the checkpoint
-> - `test_capability_engine.py` — a gap already `VERIFIED` in the registry skips search and build; a gap with a free tool skips the build but still runs static check/sandbox/test/verify; a gap without one builds/tests/verifies/registers; a capability failing verification three times marks the step `FAILED` instead of looping
+> - `test_capability_engine.py` — a gap already `VERIFIED` in the registry skips search and build; a gap with a free tool skips the build but still runs static check/sandbox/test/verify; a gap without one builds/tests/verifies/registers; a capability failing verification three times marks the step `FAILED` instead of looping; a repair round receives the previous round's failing cases; a tool under 90% accuracy, with a regression, or with inconsistent results is not registered; a research timeout still reaches the build stage; a resumed step whose output misses a downstream `input_mapping` field ends `FAILED` with `OUTPUT_DRIFT`
 > - diagnosis rules (**FR-DIAG-014**) — each rule `error_type` maps to the right outcome, and the mocked LLM wrapper is **not called** when a rule matches
 >
 > Mock all LLM calls in unit tests (**FR-DEP-006**). Hit the 70% coverage target on `orchestrator/`, `adapters/`, `capability_engine/` (**FR-DEP-005**) — API layer and models are deliberately excluded.
@@ -370,7 +380,7 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 >
 > Build the two evaluation sets that stop prompt edits from silently regressing behaviour:
 > - **FR-DIAG-011** — 20 hand-labelled error examples (10 genuine capability gaps, 10 normal errors) in `backend/tests/fixtures/`, scored as classification accuracy with an **18/20 pass bar**, re-run whenever the diagnosis prompt changes. Use only errors the rules stage does **not** match (e.g. `AGENT_ERROR` with messy text) — otherwise the score measures the rules, not the LLM
-> - **FR-CAP-018** — 5 canned gaps (the demo calculator plus four others), scored as the proportion reaching `VERIFIED` within the 3-attempt cap
+> - **FR-CAP-018** — 5 canned gaps (the demo calculator plus four others), scored as the proportion reaching `VERIFIED` (accuracy ≥ 90%, 0 regression, consistent) within the 3-round cap
 >
 > These are the only two places real API calls happen (**FR-DEP-006**) — keep them out of the default CI run.
 >
@@ -387,6 +397,8 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 >
 > Also verify **NFR-SEC-01**: no path exists by which untrusted code executes in the FastAPI backend process.
 >
+> And check the **Web Research Agent** (ADR-011): it has no Docker socket and never runs found code; web text is never followed as instructions; a found tool goes through static check → sandbox → test → verify like built code; the sandbox still runs with `--network none`.
+>
 > **Done when:** each of the three areas has a written pass/fail finding with the FR ID it was checked against.
 
 ## Prompt 22 — Observability and structured logging
@@ -397,7 +409,7 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 >
 > Every log line carries `execution_id`, `step_id` and `agent_id` where applicable (**FR-OBS-002**) — this is the debugging tool and the audit trail at the same time.
 >
-> Per **FR-OBS-003 / FR-OBS-004** and Architecture §12, every LLM call and every sandbox execution logs prompt, response and verdict. This is treated as a **safety** requirement, not just debugging: it's the only way to explain after the fact why a generated tool was trusted.
+> Per **FR-OBS-003 / FR-OBS-004** and Architecture §12, every LLM call, every sandbox execution and every web research call logs prompt, response (or research notes and sources) and verdict. This is treated as a **safety** requirement, not just debugging: it's the only way to explain after the fact why a generated tool was trusted.
 >
 > **Do NOT:** add ELK, Datadog, Grafana or OpenTelemetry — **FR-OBS-006** marks these deliberately out.
 
@@ -415,7 +427,7 @@ These map to the LYK requirements already written into the FRS. Each is self-con
 ## Prompt L2 — Generated code viewer
 > **Read first:** `docs/FRS .md` §3.7 (**FR-CAP-020**), §3.9 (**FR-UI-013**) · `docs/Architecture.md` §13.2 (`Registry.register` already stores the source)
 >
-> Add a read-only capability detail view showing the stored generated source, the verification score, the 3 test inputs, and pass/fail per input. All of this data is already stored — this is a read path only.
+> Add a read-only capability detail view showing the stored generated source, the verification score, the test cases, pass/fail per case, and the research sources. All of this data is already stored — this is a read path only.
 
 ## Prompt L3 — Agent connection test (moved into Prompt 5)
 > **FR-AGT-011** is now a Must (ADR-009) and is built in Prompt 5 via `GET /health`. Nothing to do here.
@@ -428,7 +440,7 @@ These map to the LYK requirements already written into the FRS. Each is self-con
 ## Prompt L5 — Failed-attempt history
 > **Read first:** `docs/FRS .md` §3.7 (**FR-CAP-021**), §5 (BR-10)
 >
-> Store all 3 build attempts per gap (code + failure reason), not just the final state, and show them in the capability detail view.
+> Store all 3 build rounds per gap (code, failing cases fed back, accuracy), not just the final state, and show them in the capability detail view.
 
 ## Prompt L6 — Execution report export
 > **Read first:** `docs/FRS .md` §3.10 (**FR-API-007**)

@@ -1,4 +1,4 @@
-"""Runs a built tool against 3 sample inputs.
+"""Runs a built tool against about 10 cases, each 3 times, in one sandbox run.
 
-Tester.test(code: str, samples: list[dict]) -> TestResult
+Tester.test(code: str, cases: list[dict], runs: int = 3) -> TestResult
 """
