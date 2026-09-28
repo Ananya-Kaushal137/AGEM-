@@ -1,1 +1,5 @@
-"""capabilities API router. Implemented in Prompt 3 (Architecture §10.1)."""
+"""capabilities router (Architecture §10.3). Endpoints are added by a later prompt."""
+
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/api/capabilities", tags=["capabilities"])

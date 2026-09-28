@@ -1,1 +1,5 @@
-"""agents API router. Implemented in Prompt 3 (Architecture §10.1)."""
+"""agents router (Architecture §10.3). Endpoints arrive in Prompt 5."""
+
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/api/agents", tags=["agents"])
