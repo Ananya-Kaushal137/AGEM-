@@ -1,23 +1,34 @@
-"""Settings — the single entry point for every secret (Architecture §24, P16).
+"""Settings — the single entry point for every secret (Architecture §24, P16, FR-AUTH-004).
 
-Prompt 3 extends this with `API_KEY`, the LLM provider key and the Fernet key
-(FR-AUTH-004). For now it holds only what the data layer needs, so that even the
-database URL is read in one place rather than scattered through modules.
+Nothing else in the codebase reads `os.environ`. Secrets are `SecretStr`, so a
+stray `print(settings)` or a traceback shows `**********` instead of the value.
+They are never stored in PostgreSQL and never echoed in an API response.
 """
 
 import functools
-import os
+from typing import Literal
+
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 __all__ = ["Settings", "get_settings"]
 
 
-class Settings:
+class Settings(BaseSettings):
     """Read once, from the environment, populated by docker-compose from `.env`."""
 
-    def __init__(self) -> None:
-        self.database_url: str = os.environ.get(
-            "DATABASE_URL", "postgresql://agem:agem@localhost:5432/agem"
-        )
+    model_config = SettingsConfigDict(extra="ignore")
+
+    database_url: str = "postgresql://agem:agem@localhost:5432/agem"
+
+    # FR-AUTH-001. Left empty, every request is rejected rather than let through.
+    api_key: SecretStr = SecretStr("")
+
+    llm_provider: Literal["anthropic", "openai"] = "anthropic"
+    llm_api_key: SecretStr = SecretStr("")
+
+    # FR-AUTH-005: encrypts Agent.encrypted_credentials at rest.
+    fernet_key: SecretStr = SecretStr("")
 
 
 @functools.lru_cache(maxsize=1)
