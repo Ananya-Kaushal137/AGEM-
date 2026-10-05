@@ -1,6 +1,6 @@
-"""Asks the Web Research Agent (research_agent/, ADR-011) before anything is built.
+"""Searches the web (Tavily) and summarises it through the LLM wrapper before anything is built (docs/websearch.md).
 
 Searcher.research(capability_name: str, context: dict) -> ResearchNotes
 ResearchNotes = free_tool: Tool | None, definition, examples, sources.
-One call per gap, 30 s timeout; empty notes on timeout/error.
+One research per gap, 30 s limit for search + LLM call; empty notes on timeout/error.
 """

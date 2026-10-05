@@ -136,7 +136,7 @@ Live check — I also ran the wrapper from the command line with a tiny test age
 Judgment calls — please check these
 1. Errors are raised, not converted. The adapter raises errors and step_executor.py (later prompt) converts them into {"status": "FAILED", "error_type": ..., "raw_error": ...}. That follows P13 and the build prompts, which put normalisation in step_executor.py. It means FR-ADP-008's "malformed JSON normalised into the standard error shape" test can only be fully written when step_executor.py exists. For now the tests check each failure raises its own distinct error.
 
-2. 30-second timeout for agent calls. The docs say everything must be bounded (P11) but never give a number for a normal agent call. I used 30 s, the same as the only agent-call limit the docs do give (the Web Research Agent, ADR-011). It can be changed per adapter: RestAdapter(endpoint, timeout=60). health() uses 5 s. If you want an official number, it's a docs change.
+2. 30-second timeout for agent calls. The docs say everything must be bounded (P11) but never give a number for a normal agent call. I used 30 s, the same as the only other call limit the docs do give (web research — 30 s, docs/websearch.md). It can be changed per adapter: RestAdapter(endpoint, timeout=60). health() uses 5 s. If you want an official number, it's a docs change.
 
 3. Agent credentials are not sent yet. The docs say credentials are stored encrypted (Prompt 5), but never say how they're sent to the agent — which header, what format. So the adapter doesn't send them. This needs a decision before or during Prompt 5.
 

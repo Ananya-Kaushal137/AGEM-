@@ -352,7 +352,7 @@ The recovery logic lives **outside** `orchestrator.py`. The Orchestrator only ca
 
 ```
 0. REGISTRY   — already have a VERIFIED tool with this name?  yes → skip to RESUME
-1. RESEARCH   — the Web Research Agent searches the web (see 5.4):
+1. RESEARCH   — searcher.py searches the web (see 5.4):
                 a free / open-source tool exists?             yes → skip BUILD, still check it
                 also brings back the formula / definition and worked examples with answers
 2. BUILD      — the LLM (stronger model) writes a Python function, using the research notes. Never run here.
@@ -397,7 +397,7 @@ Accuracy, regression and consistency run inside VERIFY (stage 6), in **one** san
 - Edge cases: zero, negative, very large values, bad input that must raise an error.
 - Property checks: right type, sensible range, no crash.
 
-For the demo, the cases are written by hand. For a tool nobody has seen before, the **worked examples found by the Web Research Agent** (5.4) become reference cases — answers that come from outside the LLM, not from the code being tested. If research finds none, the LLM may propose cases in a **separate** call, and the property checks still apply.
+For the demo, the cases are written by hand. For a tool nobody has seen before, the **worked examples found by web search** (5.4) become reference cases — answers that come from outside the LLM, not from the code being tested. If research finds none, the LLM may propose cases in a **separate** call, and the property checks still apply.
 
 **The refinement loop**
 
@@ -426,43 +426,29 @@ After resume, Finance returns `{"revenue": 96.7, "profit": 7.1, ...}`. The Fact 
 
 **Honest limit (say this in the viva):** the score proves the tool is correct **on its test cases**, not on every possible input. Report it as "verified on N cases", never as "100% accurate".
 
-### 5.4 The Web Research Agent
+### 5.4 Web search
 
-The LLM used by the Master Agent and the Capability Engine answers only from what it already knows — it does not search the web by itself. So AGEM adds one **Web Research Agent** whose only job is to look things up on the web when a capability gap happens.
+The LLM used by the Master Agent and the Capability Engine answers only from what it already knows — it does not search the web by itself. So when a capability gap happens, `searcher.py` looks things up on the web. There is **no separate agent or container** for this (ADR-012; full explanation in `docs/websearch.md`).
 
-**Where it sits:** it is called by the **Capability Engine** at stage 1 (RESEARCH), **after** the Master Agent has said `CAPABILITY_GAP` and the registry had nothing. The Master Agent itself is unchanged — it still only diagnoses.
+**Where it sits:** stage 1 (RESEARCH) of the Capability Engine, **after** the Master Agent has said `CAPABILITY_GAP` and the registry had nothing. The Master Agent itself is unchanged — it still only diagnoses.
 
 ```
 Master Agent says CAPABILITY_GAP
       ↓
 Capability Engine: registry?  → found → RESUME
       ↓ not found
-Web Research Agent  (searches the web)
+searcher.py:  1. Tavily search API  →  2. one LLM wrapper call
       ↓ research notes
 BUILD (LLM uses the notes) → STATIC CHECK → SANDBOX → TEST → VERIFY → REGISTER
 ```
 
-**How it is built:** it is a **system agent** that follows the same agent contract as every other agent (`/health` + `/execute`, Section 1.2), runs in its own container, and is called through the REST adapter. Inside, it uses a web search API to search and read pages, and an LLM to summarise what it found. AGEM ships it; developers do not register it.
-
-**What it is asked:**
+**How it works:** `searcher.py` sends one search to the **Tavily** search API (free tier, 1,000 searches a month) with plain `httpx`, gets back the top pages as text, then makes **one** call through the single LLM wrapper to turn them into research notes:
 
 ```json
-POST /execute
-{ "task": "research_capability",
-  "input": { "capability": "calculate_compound_interest",
-             "context": "Finance Agent, company investment report" } }
-```
-
-**What it returns (research notes):**
-
-```json
-{ "status": "SUCCEEDED",
-  "output": {
-    "free_tool":   null,                                   // or a package / function name, if one exists
-    "definition":  "A = P × (1 + r/n)^(n×t)",
-    "examples":    [ {"input": {"P": 1000, "r": 0.05, "t": 10, "n": 1}, "expected": 1628.89} ],
-    "sources":     ["https://...", "https://..."]
-  } }
+{ "free_tool":   null,                                   // or a package / function name, if one exists
+  "definition":  "A = P × (1 + r/n)^(n×t)",
+  "examples":    [ {"input": {"P": 1000, "r": 0.05, "t": 10, "n": 1}, "expected": 1628.89} ],
+  "sources":     ["https://...", "https://..."] }
 ```
 
 **How AGEM uses the notes:**
@@ -474,11 +460,11 @@ POST /execute
 | `sources` | Capabilities page | Shown next to the tool, so a person can see where the knowledge came from |
 
 **Rules:**
-- **One research call per gap**, **30-second** limit. No answer, an error, or empty notes → the Capability Engine simply continues to BUILD without notes. Research can help, but it can **never block** recovery.
+- **One research per gap**, **30-second** limit for search + LLM call. No answer, an error, or empty notes → the Capability Engine simply continues to BUILD without notes. Research can help, but it can **never block** recovery.
 - **Web content is data, not instructions.** Text from a web page is never followed as a command, and code found on the web is **never run** outside the sandbox — it goes through the same static check, sandbox, test and verify as built code.
-- The Web Research Agent has internet; the **sandbox still has none**. The agent only reads and summarises; it never installs or runs anything.
+- `searcher.py` only reads text; the **sandbox still has no internet**.
 - Research notes are **saved with the tool** in the registry, so the same gap is never researched twice.
-- **Demo safety:** for the live demo, the research result for `calculate_compound_interest` is also saved in advance. If the web is slow or down during the demo, AGEM uses the saved notes, so the demo never depends on the internet.
+- **Demo safety:** the research result for `calculate_compound_interest` is also saved in advance. If the web is slow or down during the demo, AGEM uses the saved notes, so the demo never depends on the internet.
 
 ---
 
@@ -564,7 +550,7 @@ async def run_one(step):
 
 ## 9. The demo, start to finish
 
-**Demo agents:** Research, Finance, Fact Checker and Writer — each wrapped with the template, each its own container in `docker-compose.yml` (ports 9001–9004). `scripts/seed_agents.py` registers all four through `POST /api/agents`. The **Web Research Agent** is AGEM's own system agent (port 9005), started by `docker-compose.yml` with the rest.
+**Demo agents:** Research, Finance, Fact Checker and Writer — each wrapped with the template, each its own container in `docker-compose.yml` (ports 9001–9004). `scripts/seed_agents.py` registers all four through `POST /api/agents`. Web search needs no container — it runs inside the backend (`searcher.py`).
 
 **Workflow:** Research → Finance → Fact Checker → Writer. Task: "Create a company investment report."
 
@@ -573,7 +559,7 @@ async def run_one(step):
    `{"status": "FAILED", "error": "MISSING_CAPABILITY", "capability": "calculate_compound_interest"}`
 3. Only Finance pauses. Research is safe.
 4. Master Agent rule: `MISSING_CAPABILITY` → `CAPABILITY_GAP`. **No LLM needed**, so the demo is reliable.
-5. Registry: nothing yet. The Web Research Agent searches the web: no free tool, but it brings back the compound-interest formula and worked examples (saved notes are used if the web is down).
+5. Registry: nothing yet. Web search (`searcher.py` + Tavily): no free tool, but it brings back the compound-interest formula and worked examples (saved notes are used if the web is down).
 6. Build: the LLM writes `calculate_compound_interest()` from the formula in the notes.
 7. Static check → sandbox → test → verify (accuracy, regression, consistency) — refined until it passes. Registered as VERIFIED with its score.
 8. AGEM runs the tool in the sandbox and resumes Finance with the result in `context.tool_results`.
@@ -615,7 +601,7 @@ Nothing in AGEM can loop forever.
 | API (`backend/app/api/`), DB models, frontend | Person 1 — Ananya |
 | `master_agent.py` (rules + LLM) | Person 2 — Guthal |
 | Capability Engine (`capability_engine/`) and `sandbox_runner/` | Person 2 — Guthal |
-| Web Research Agent (system agent) | Person 2 — Guthal |
+| Web search (`searcher.py`) | Person 2 — Guthal |
 | Most tests, LLM prompts | Person 2 — Guthal |
 | Agent contract, DB schema, demo agents, demo script | Both |
 
@@ -634,7 +620,7 @@ Nothing in AGEM can loop forever.
 | **CheckpointManager** | Saves and restores progress |
 | **Master Agent** | Diagnoses why a step failed |
 | **Capability Engine** | Finds or builds a missing tool, safely |
-| **Web Research Agent** | Searches the web for a free tool, the formula and worked examples when a tool is missing |
+| **Web search** | `searcher.py` searches the web (Tavily + LLM wrapper) for a free tool, the formula and worked examples when a tool is missing |
 | **Docker Sandbox** | The only place untrusted code runs |
 | **Registry** | Keeps verified tools so they are reused, not rebuilt |
 | **PostgreSQL** | The single source of truth |
@@ -659,10 +645,10 @@ These are the final decisions. The team should agree on them, and the FRS, Archi
 | 10 | Tool **result** sent to the agent in `context.tool_results` | Tool "given to the agent" |
 | 11 | Parallel steps built **after** sequential works (still MUST) | Parallel from the start |
 | 12 | Built tools are **refined until verified** (≥ 90% accuracy, 0 regression, consistent, no output drift); the LLM itself is **not** fine-tuned | "test and verify" |
-| 13 | A **Web Research Agent** does the web search for the Capability Engine (the LLM cannot search by itself); its notes feed BUILD and VERIFY | "search for a free tool" |
+| 13 | **`searcher.py`** does the web search for the Capability Engine (Tavily + one LLM call; the LLM cannot search by itself); its notes feed BUILD and VERIFY | "search for a free tool" |
 
 ---
 
 ## 14. Short answer for the viva
 
-> "Developers register agents they already built by giving AGEM an HTTP endpoint; code-only agents use a small wrapper, so no agent code is ever imported or changed. The user builds a workflow as a DAG, which is checked for loops once, when it is saved. The Orchestrator runs READY steps in order, calling each agent through an adapter, and saves a checkpoint after every step. When a step fails, only that step pauses. The Master Agent classifies the failure — obvious errors by rules, unclear ones by one validated LLM call. A normal error is retried up to 3 times. A capability gap goes to the Capability Engine: reuse from the registry, else a Web Research Agent searches the web for a free tool and the correct formula, else the LLM builds one from those notes — and every new tool is checked, run in a locked sandbox, tested and refined until it scores at least 90% accuracy with zero regression and consistent outputs, before it is registered. AGEM then runs the tool, sends its result to the same agent, resumes only that step, and checks its output has not drifted from what the next agent expects. Everything has a limit, and the whole run is visible live on the dashboard."
+> "Developers register agents they already built by giving AGEM an HTTP endpoint; code-only agents use a small wrapper, so no agent code is ever imported or changed. The user builds a workflow as a DAG, which is checked for loops once, when it is saved. The Orchestrator runs READY steps in order, calling each agent through an adapter, and saves a checkpoint after every step. When a step fails, only that step pauses. The Master Agent classifies the failure — obvious errors by rules, unclear ones by one validated LLM call. A normal error is retried up to 3 times. A capability gap goes to the Capability Engine: reuse from the registry, else web search looks for a free tool and the correct formula, else the LLM builds one from those notes — and every new tool is checked, run in a locked sandbox, tested and refined until it scores at least 90% accuracy with zero regression and consistent outputs, before it is registered. AGEM then runs the tool, sends its result to the same agent, resumes only that step, and checks its output has not drifted from what the next agent expects. Everything has a limit, and the whole run is visible live on the dashboard."

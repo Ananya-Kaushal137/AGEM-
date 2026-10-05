@@ -1,5 +1,8 @@
 # ADR-011 — A Web Research Agent Performs Web Search for the Capability Engine
 
+> **Status: SUPERSEDED by ADR-012** (`ADR-012-web-search-in-searcher.md`). Kept for history; nothing below is built.
+
+
 See Architecture §31 and `docs/final_flow.md` §5.4. The LLM answers only from what it already
 knows, so a system agent in `research_agent/` (port 9005, standard `/health` + `/execute` contract)
 searches the web when a capability is missing. It returns research notes: a free tool if one exists,

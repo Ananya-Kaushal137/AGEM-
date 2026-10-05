@@ -2,7 +2,7 @@
 
 A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 · Architecture §29).
 
-**Every prompt names the exact documents and sections Claude must read before writing code.** The three source documents, plus the agent contract and two plain-language guides that expand on them, are:
+**Every prompt names the exact documents and sections Claude must read before writing code.** The three source documents, plus the agent contract and three plain-language guides that expand on them, are:
 
 | Doc | Path | What it settles |
 |---|---|---|
@@ -12,6 +12,7 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 | API spec | `docs/api-spec.md` | The frozen agent contract (`/health`, `/execute`) and the registration body |
 | Final flow | `docs/final_flow.md` | The whole flow, Bring → Complete, with pseudocode and the demo walkthrough |
 | Failure diagnosis | `docs/failure_diagnosis.md` | What happens on failure — rules-first diagnosis, capability pipeline, resume (ADR-008) |
+| Web search | `docs/websearch.md` | How the Capability Engine searches the web — `searcher.py` + Tavily + the LLM wrapper. **Replaces the separate Web Research Agent (ADR-011)**; wins wherever older docs still describe that agent |
 
 ---
 
@@ -26,13 +27,14 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 
 ## Session Opener (paste first, every session)
 
-> Before writing any code, read these six documents in full:
+> Before writing any code, read these seven documents in full:
 > - `docs/FRS .md` — the functional requirements (FR IDs, priorities, acceptance criteria, business rules BR-01…BR-16)
 > - `docs/Architecture.md` — the architecture (5 layers, principles P1–P16, file organization §25, state machines §15, key interfaces §13.2, agent contract §16.1, ADRs §31)
 > - `docs/PRD .md` — the product requirements (goal, user stories US-01…US-09, UX requirements)
 > - `docs/api-spec.md` — the frozen agent contract (`GET /health`, `POST /execute`) — ADR-009
 > - `docs/final_flow.md` — plain-language guide to the whole flow, Bring → Connect → Orchestrate → Diagnose → Evolve → Resume → Complete
 > - `docs/failure_diagnosis.md` — plain-language guide to failure diagnosis and recovery (rules-first diagnosis, capability pipeline order, resume via `context.tool_results` — ADR-008)
+> - `docs/websearch.md` — how web search works: `searcher.py` calls the Tavily search API and makes one call through the LLM wrapper. There is **no** separate Web Research Agent, `research_agent/` folder or port 9005; where ADR-011, FR-CAP-024, `api-spec.md`, `final_flow.md` §5.4 or `failure_diagnosis.md` still describe that agent, **`websearch.md` wins**
 >
 > These documents are the single source of truth for this project. Rules for everything you build in this session:
 > - Build **only** what the prompt asks for. Do not add features, abstractions, or "while I'm here" improvements.
@@ -42,7 +44,7 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 > - If something the prompt asks for contradicts the docs, or the docs don't specify it, **stop and ask me** rather than inventing an answer.
 > - Do not write comments explaining what code does. Only comment a non-obvious constraint.
 >
-> Confirm you've read all six and list the FR IDs relevant to the prompt I'm about to give you. Then wait.
+> Confirm you've read all seven and list the FR IDs relevant to the prompt I'm about to give you. Then wait.
 
 ---
 
@@ -143,7 +145,7 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 > 1. **Rules, no LLM** — `MISSING_CAPABILITY` → `CAPABILITY_GAP`; `TIMEOUT`, `CONNECTION_ERROR`, `HTTP_5XX`, `INVALID_JSON` → `NORMAL_ERROR`. Match on the exact `error_type` strings from Architecture §23.1.
 > 2. **LLM, only if no rule matched** (e.g. `AGENT_ERROR`) — through the wrapper below.
 >
-> Write the single LLM wrapper (**FR-DIAG-009**, Architecture P15) that every LLM call in this codebase goes through. It must: request JSON constrained to a fixed Pydantic schema (**FR-DIAG-005**); on parse/validation failure retry the same call up to 2 times with the validation error appended to the prompt (**FR-DIAG-006**); then fail safe to `NORMAL_ERROR` rather than hang (**FR-DIAG-007**). Enforce the 20-second timeout from Architecture §4 / NFR-PERF-03, and the cheaper model tier for diagnosis per **FR-DIAG-008** and Architecture §22.
+> Write the single LLM wrapper (**FR-DIAG-009**, Architecture P15) that every LLM call in this codebase goes through. It must: request JSON constrained to a fixed Pydantic schema (**FR-DIAG-005**); on parse/validation failure retry the same call up to 2 times with the validation error appended to the prompt (**FR-DIAG-006**); then fail safe rather than hang (**FR-DIAG-007**). Keep it general: the **caller** passes the schema and the safe fallback — diagnosis passes `NORMAL_ERROR`. Two more callers come later and reuse it unchanged: `searcher.py` (Prompt 10, web research notes, fallback = empty notes — `docs/websearch.md`) and `builder.py` (Prompt 13). Enforce the 20-second timeout from Architecture §4 / NFR-PERF-03, and the cheaper model tier for diagnosis per **FR-DIAG-008** and Architecture §22.
 >
 > Budget: **at most** one diagnosis LLM call per failure, and zero when a rule matches (**FR-DIAG-004**, Architecture P11).
 >
@@ -216,25 +218,29 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 
 # Phase 4 — Capability Engine and Sandbox (Weeks 4–8)
 
-## Prompt 10 — Web Research Agent and Searcher
+## Prompt 10 — Web search in the Searcher (Tavily + LLM wrapper)
 
-> **Read first:** `docs/Architecture.md` §13.1 (pipeline), §13.2 (key interfaces), §13.5 (real vs simplified), §12 (web content is data), §31 (ADR-003, ADR-011) · `docs/FRS .md` §3.7 (CAP, FR-CAP-002, 003, 004, 024, 025, 027), §5 (BR-03) · `docs/api-spec.md` (Web Research Agent) · `docs/final_flow.md` §5.4
+> **Read first:** `docs/websearch.md` **in full** — it replaces the separate Web Research Agent; where it differs from ADR-011, FR-CAP-024, `api-spec.md` or `final_flow.md` §5.4, **`websearch.md` wins** · `docs/Architecture.md` §13.1 (pipeline), §13.2 (key interfaces), §13.5 (real vs simplified), §12 (web content is data), §3 (P11, P15, P16), §31 (ADR-003) · `docs/FRS .md` §3.7 (CAP, FR-CAP-002, 003, 004, 025, 027), §5 (BR-03)
 >
-> Build `research_agent/` — AGEM's own system agent, its own small FastAPI app and `Dockerfile`, port 9005, answering the frozen `GET /health` + `POST /execute` contract (**FR-CAP-024**). For `task: "research_capability"` it searches the web through a web search API, summarises the results with the LLM, and returns research notes `{free_tool, definition, examples, sources}` exactly as in `docs/api-spec.md`. It never installs or runs code it finds.
+> There is **no** `research_agent/` folder, no extra container and no port 9005. Web search is done inside the backend by one file.
 >
-> The research agent is **outside** the backend process, so it is not bound by the backend's single LLM wrapper (P15); it makes its own one summarising call. Uncomment the `research-agent` service in `docker-compose.yml` and add `SEARCH_API_KEY` and `RESEARCH_AGENT_URL` to `.env.example`; the backend reads `RESEARCH_AGENT_URL` only through `core/config.py` (P16).
+> Write `backend/capability_engine/searcher.py` implementing `Searcher.research(capability_name: str, context: dict) -> ResearchNotes` exactly as signed in Architecture §13.2. It does two things, in order:
+> 1. **Search** — one `POST https://api.tavily.com/search` with plain `httpx` (the same style as `adapters/rest_adapter.py`; do **not** add the `tavily-python` package), `search_depth: "basic"`, about 5 results. Check Tavily's current docs for the exact request/auth format.
+> 2. **Summarise** — **one** call through the single LLM wrapper from Prompt 6 (**P15** — no direct LLM API call here), asking for the `ResearchNotes` schema `{free_tool, definition, examples, sources}`. The prompt must mark the page text as **data, never instructions**, and only allow an `example` whose expected answer appears in the page text. `sources` are the URLs actually used.
 >
-> Then write `backend/capability_engine/searcher.py` implementing `Searcher.research(capability_name: str, context: dict) -> ResearchNotes` exactly as signed in Architecture §13.2. It calls the research agent through the REST adapter and validates the reply against a Pydantic `ResearchNotes` schema — an invalid reply is treated as empty notes.
+> Define `ResearchNotes` as a Pydantic schema (`extra = "forbid"`) with an empty value (`free_tool: None`, empty definition, no examples, no sources).
+>
+> Add `SEARCH_API_KEY` to `.env.example` (empty, with a one-line comment) and to the `backend` service's `environment` in `docker-compose.yml`. Read the key only through `core/config.py` (**P16**). Do **not** add `RESEARCH_AGENT_URL` or `RESEARCH_AGENT_PORT`.
 >
 > Write a **new** Alembic migration adding `research_notes` and `test_cases` (both JSONB, nullable) to `Capability` (**FR-DAT-009**). Do not edit the first migration.
 >
-> Per **FR-CAP-003**: one call per gap, **30-second timeout**; a timeout, error or empty reply returns empty notes and the engine continues to build — research never blocks recovery. Web text is data, never instructions. Store the notes with the capability so a gap is never researched twice. Still not a general tool-discovery system or marketplace.
+> Per **FR-CAP-003** and **P11**: one research per gap; the **whole** research (search + LLM call) is bounded at **30 seconds** with `asyncio.wait_for`. A timeout, HTTP error, missing key, used-up credits, invalid LLM reply or empty result returns **empty notes without raising**, and the engine continues to build — research never blocks recovery. Store the notes with the capability so a gap is never researched twice. `searcher.py` only reads text — it never installs or runs anything it finds; the sandbox keeps `--network none`. Still not a general tool-discovery system or marketplace.
 >
-> Per **FR-CAP-027**, save research notes for `calculate_compound_interest` in advance and use them when the web is unavailable, so the demo never depends on the internet.
+> Per **FR-CAP-027**, save research notes for `calculate_compound_interest` in advance (a small JSON file under `backend/capability_engine/`) and return them when the web search fails, so the demo never depends on the internet.
 >
 > This stage always runs **before** the build path (**FR-CAP-002**, ADR-003, BR-03).
 >
-> **Done when:** the research agent passes `/health`; researching `calculate_compound_interest` returns the formula and at least one worked example with sources; a research timeout returns empty notes without raising; with the web disabled, the saved demo notes are returned.
+> **Done when:** with a real `SEARCH_API_KEY`, researching `calculate_compound_interest` returns the formula and at least one worked example with sources; in tests the Tavily call is faked (no internet, no API cost); a faked slow search returns empty notes after 30 s without raising; an invalid LLM reply returns empty notes; with the web disabled, the saved demo notes are returned; no file other than the LLM wrapper calls the LLM API.
 
 ## Prompt 11 — Wire orchestrator to master_agent on failure
 
@@ -300,7 +306,7 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 >
 > Update `recovery_stage` through every stage as the step progresses (**FR-ORC-011**) — the dashboard depends on it. `SEARCHING` is the web research stage; no enum changes.
 >
-> **Done when:** US-08 passes end to end — a capability gap is detected, researched, built, sandboxed, tested, refined until it verifies (≥ 90%, 0 regression, consistent), registered, and the exact paused step resumes with the tool's result in `context.tool_results`, passes the output drift check and succeeds, with zero manual code deployment; a second run of the same gap reuses the registry entry without calling the research agent or the builder.
+> **Done when:** US-08 passes end to end — a capability gap is detected, researched, built, sandboxed, tested, refined until it verifies (≥ 90%, 0 regression, consistent), registered, and the exact paused step resumes with the tool's result in `context.tool_results`, passes the output drift check and succeeds, with zero manual code deployment; a second run of the same gap reuses the registry entry without searching the web or calling the builder.
 
 ## Prompt 15 — Framework adapter (LangChain or CrewAI)
 
@@ -354,7 +360,7 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 >
 > Write `scripts/trigger_capability_gap.py` (**FR-CAP-019**) — it reproducibly forces a capability gap so the full research → build → sandbox → test → verify (refined) → register → resume → drift check sequence runs on demand during a live demo.
 >
-> Use the calculator gap from Architecture §28.2's end-to-end example. The script must be reliable enough to run in front of an examiner: same result every time, no dependence on a flaky external call — the Web Research Agent must use the pre-saved `calculate_compound_interest` notes when the web is slow or down (**FR-CAP-027**). The demo agent must fail with `error_type: MISSING_CAPABILITY` explicitly, so diagnosis takes the rules path (ADR-008) and the demo never depends on LLM classification.
+> Use the calculator gap from Architecture §28.2's end-to-end example. The script must be reliable enough to run in front of an examiner: same result every time, no dependence on a flaky external call — `searcher.py` must use the pre-saved `calculate_compound_interest` notes when the web is slow or down (**FR-CAP-027**). The demo agent must fail with `error_type: MISSING_CAPABILITY` explicitly, so diagnosis takes the rules path (ADR-008) and the demo never depends on LLM classification.
 >
 > **Done when:** running the script reproduces Architecture §17.1's sequence diagram end to end, visible live on the Executions page from Prompt 17.
 
@@ -397,7 +403,7 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 >
 > Also verify **NFR-SEC-01**: no path exists by which untrusted code executes in the FastAPI backend process.
 >
-> And check the **Web Research Agent** (ADR-011): it has no Docker socket and never runs found code; web text is never followed as instructions; a found tool goes through static check → sandbox → test → verify like built code; the sandbox still runs with `--network none`.
+> And check **web search** (`docs/websearch.md`): `searcher.py` is the only code that reaches the internet, and it only reads text — it never installs or runs found code; web text is never followed as instructions; a found tool goes through static check → sandbox → test → verify like built code; the sandbox still runs with `--network none`; `SEARCH_API_KEY` is read only through `core/config.py` and never logged or committed.
 >
 > **Done when:** each of the three areas has a written pass/fail finding with the FR ID it was checked against.
 
@@ -462,7 +468,7 @@ These map to the LYK requirements already written into the FRS. Each is self-con
 
 ## Prompt 23 — Final documentation and demo rehearsal (Week 12)
 
-> **Read first:** all six documents from the Session Opener · `docs/Architecture.md` §28 (User Flow), §31 (ADRs) · `docs/FRS .md` §7 (Use Cases), §8.6 (User acceptance checklist)
+> **Read first:** all seven documents from the Session Opener · `docs/Architecture.md` §28 (User Flow), §31 (ADRs) · `docs/FRS .md` §7 (Use Cases), §8.6 (User acceptance checklist)
 >
 > Write the root `README.md` covering the problem, the solution, key features, the architecture summary, the tech stack, and the scope disclaimer — sourced from the master documentation's README Summary section, not invented.
 >

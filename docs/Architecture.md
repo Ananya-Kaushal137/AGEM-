@@ -68,7 +68,7 @@ The two-person team building AGEM, and anyone reviewing or examining it.
 | Capability | A specific skill or tool an agent needs but might not have (e.g. "calculate compound interest"). |
 | Tool | The actual implementation of a capability (a Python function, an API call). |
 | Capability Engine | The system that detects a capability gap and resolves it: research → build → sandbox → test → verify → register. |
-| Web Research Agent | AGEM's own system agent that searches the web when a capability is missing, returning a free tool (if any), the formula and worked examples. |
+| Web search | `capability_engine/searcher.py` searches the web (Tavily search API + one LLM wrapper call) when a capability is missing, returning a free tool (if any), the formula and worked examples (ADR-012, `docs/websearch.md`). |
 | Output drift | A resumed step's output no longer fitting what the next step expects (missing field or wrong type). |
 | Adapter | A wrapper that translates a specific agent's interface (LangChain/CrewAI/REST) into AGEM's standard contract, so the Orchestrator doesn't need to know what framework the agent uses. |
 | Registry | A database table of verified capabilities so they can be reused instead of rebuilt. |
@@ -366,7 +366,7 @@ These are concrete controls, not aspirations — each maps to a specific setting
 | Schema-constrained LLM output | Every LLM call requests a JSON response constrained to a fixed Pydantic schema | `master_agent.py`, `builder.py` |
 | Validation retry + fail-safe | Retry the same call up to 2 times with the validation error appended to the prompt; after that, fail safe to `NORMAL_ERROR` rather than proceed on an unvalidated response | LLM wrapper (single entry point, no module calls the LLM API directly) |
 | Bounded build/repair attempts | A hard cap of 3 build/repair attempts per capability gap | `capability_engine/` — after 3 failures the step is marked `FAILED` and surfaced to the user instead of looping indefinitely |
-| Web content is data | Text returned by the Web Research Agent is never followed as instructions; code found on the web goes through the same static check → sandbox → test → verify as built code; one research call per gap, 30 s timeout | `capability_engine/searcher.py`, `research_agent/` (ADR-011) |
+| Web content is data | Web text found by `searcher.py` is never followed as instructions; code found on the web goes through the same static check → sandbox → test → verify as built code; one research per gap, 30 s limit | `capability_engine/searcher.py` (ADR-012) |
 | Output drift guard | After a resumed step finishes, its output is checked against the downstream step's `input_mapping` (fields present, right types) before it is marked `SUCCEEDED` | `orchestrator/step_executor.py` (ADR-010) |
 | Full audit logging | Every LLM call and every sandbox execution is logged (prompt, response, verdict) | Structured JSON logs — this is the only way to explain after the fact why a given generated tool was trusted |
 
@@ -382,7 +382,7 @@ flowchart LR
     D -->|NORMAL_ERROR| R[Retry step, max 3, then FAILED]
     D -->|CAPABILITY_GAP| RC[Registry: VERIFIED match?]
     RC -->|yes| RESUME
-    RC -->|no| S[Searcher: ask Web Research Agent]
+    RC -->|no| S[Searcher: web search via Tavily + LLM wrapper]
     S -->|free tool found| IC[Static import check]
     S -->|no free tool; notes: formula + examples| B[Builder: LLM generates Python source from notes]
     B --> IC
@@ -398,7 +398,7 @@ flowchart LR
     V -->|fail, 3 rounds exhausted| FAIL[Step FAILED, CAPABILITY_BUILD_FAILED]
 ```
 
-The LLM is **not** fine-tuned. What is refined is the generated tool: failing cases (input, returned value, expected value) are fed back into the next build prompt until the tool passes all checks (ADR-010). The Web Research Agent is a system agent that searches the web because the LLM cannot (ADR-011). Plain-language walkthrough: `docs/final_flow.md` §5.2–5.4.
+The LLM is **not** fine-tuned. What is refined is the generated tool: failing cases (input, returned value, expected value) are fed back into the next build prompt until the tool passes all checks (ADR-010). `searcher.py` searches the web because the LLM cannot (ADR-012). Plain-language walkthrough: `docs/final_flow.md` §5.2–5.4 and `docs/websearch.md`.
 
 ### 13.2 Key interfaces (function signatures)
 These signatures are the contract between the two people's work — fixing them lets both build in parallel from Week 3 without waiting on each other.
@@ -406,7 +406,7 @@ These signatures are the contract between the two people's work — fixing them 
 | Signature | File |
 |---|---|
 | `CapabilityEngine.resolve_gap(capability_name: str, context: dict) -> Capability \| None` | `capability_engine/engine.py` |
-| `Searcher.research(capability_name: str, context: dict) -> ResearchNotes` — calls the Web Research Agent; `ResearchNotes` = `free_tool: Tool \| None`, `definition`, `examples`, `sources`; empty notes on timeout/error | `capability_engine/searcher.py` |
+| `Searcher.research(capability_name: str, context: dict) -> ResearchNotes` — searches Tavily, then one LLM wrapper call; `ResearchNotes` = `free_tool: Tool \| None`, `definition`, `examples`, `sources`; empty notes on timeout/error | `capability_engine/searcher.py` |
 | `Builder.build(capability_name: str, spec: dict, notes: ResearchNotes, feedback: list[dict] \| None) -> str` — returns Python source, never executes it; `feedback` = failing cases from the previous round | `capability_engine/builder.py` |
 | `Sandbox.run(code: str, inputs: list[dict]) -> SandboxResult` | `capability_engine/sandbox.py` |
 | `Tester.test(code: str, cases: list[dict], runs: int = 3) -> TestResult` — about 10 cases, each run 3 times, in one sandbox run | `capability_engine/tester.py` |
@@ -427,7 +427,7 @@ A fresh container per run, code and inputs passed in by file mount, `--network n
 |---|---|
 | Agent reports missing capability | REAL — structured error object, e.g. `{"error": "MISSING_CAPABILITY", "capability": "..."}` |
 | Detect missing capability | REAL — `master_agent.py` calls the LLM and classifies the failure |
-| Build/acquire capability | REAL for "build" (LLM generates a Python function from the research notes). REAL for "research" (the Web Research Agent searches the web, one call, 30 s). SIMPLIFIED for "acquire" (a free tool is only used if the research names one; no general discovery system or marketplace) |
+| Build/acquire capability | REAL for "build" (LLM generates a Python function from the research notes). REAL for "research" (`searcher.py` searches the web via Tavily, once per gap, 30 s). SIMPLIFIED for "acquire" (a free tool is only used if the research names one; no general discovery system or marketplace) |
 | Sandbox | REAL — a separate Docker container, no internet access, execution timeout. Not simplified: this is a core safety claim |
 | Test / Verify | REAL — about 10 cases (reference answers from research or hand-written, edge cases, property checks), each run 3 times; accuracy ≥ 90%, 0 regression, consistent outputs; output drift checked after resume. SIMPLIFIED in that it proves correctness on the test cases only, not full formal verification |
 | Register | REAL — written to the capability table in PostgreSQL |
@@ -679,7 +679,7 @@ Final task result; execution history; agent outputs; errors and recovery events;
 
 ## 22. Cost Architecture
 
-The only real variable cost in AGEM's MVP is LLM API calls (plus the web search API used by the Web Research Agent), made from exactly three places: `master_agent.py` (failure diagnosis), the Web Research Agent (summarising search results, one call per gap) and `builder.py` (capability generation and repair).
+The only real variable cost in AGEM's MVP is LLM API calls (plus the Tavily search API, free tier), made from exactly three places, all through the one LLM wrapper: `master_agent.py` (failure diagnosis), `searcher.py` (summarising search results, one call per gap) and `builder.py` (capability generation and repair).
 
 | Decision | Detail |
 |---|---|
@@ -702,7 +702,7 @@ Every step execution is wrapped in try/except inside `step_executor.py`. Any exc
 | Step succeeds | Orchestrator moves to the next step normally |
 | Step fails — normal error | Only that step pauses; retried up to 3 times, then marked `FAILED` — no rebuilding needed |
 | Step fails — capability gap, already in registry | The `VERIFIED` capability is reused; the paused step resumes |
-| Step fails — capability gap, free tool exists | Web Research Agent names it; tool goes through static check → sandbox → test → verify, then the paused step resumes and its output is drift-checked |
+| Step fails — capability gap, free tool exists | Web search names it; tool goes through static check → sandbox → test → verify, then the paused step resumes and its output is drift-checked |
 | Step fails — capability gap, no free tool | Capability Engine builds from the research notes → static check → sandbox → test → verify, refined with failing-case feedback (max 3 rounds) |
 | Resumed step's output does not fit the next step | Step marked `FAILED` (`OUTPUT_DRIFT`); the downstream step never runs |
 | Verification fails | Improve/rebuild the capability and test again, bounded by the retry limit |
@@ -759,7 +759,7 @@ agem/
 │   │
 │   ├── capability_engine/
 │   │   ├── engine.py       main capability gap resolution flow
-│   │   ├── searcher.py     asks the Web Research Agent: free tool, formula, worked examples
+│   │   ├── searcher.py     searches the web (Tavily + LLM wrapper): free tool, formula, worked examples
 │   │   ├── builder.py      LLM-based tool generation, refined with failing-case feedback
 │   │   ├── sandbox.py      isolated execution (Docker subprocess)
 │   │   ├── tester.py       runs tool against ~10 cases, each 3 times
@@ -783,7 +783,6 @@ agem/
 │
 ├── demo_agents/            Research · Finance · Fact Checker · Writer — each wrapped, own container (ports 9001–9004)
 │
-├── research_agent/         Web Research Agent — AGEM's own system agent, own container (port 9005), same /health + /execute contract
 │
 ├── database/
 │   └── init.sql            base schema if needed outside migrations
@@ -791,7 +790,7 @@ agem/
 ├── docs/
 │   ├── architecture.md
 │   ├── api-spec.md
-│   ├── adr/                ADR-001-separate-sandbox.md · ADR-002-orchestrator-master-agent.md · ADR-008-rules-first-diagnosis.md · ADR-009-agent-registration-over-http.md · ADR-010-refine-until-verified.md · ADR-011-web-research-agent.md
+│   ├── adr/                ADR-001-separate-sandbox.md · ADR-002-orchestrator-master-agent.md · ADR-008-rules-first-diagnosis.md · ADR-009-agent-registration-over-http.md · ADR-010-refine-until-verified.md · ADR-011-web-research-agent.md (superseded) · ADR-012-web-search-in-searcher.md
 │   ├── final_flow.md          plain-language guide to the whole flow, Bring → Complete
 │   ├── failure_diagnosis.md   plain-language guide to diagnosis and recovery
 │   └── demo-script.md
@@ -834,7 +833,7 @@ After the first migration exists, schema changes go through Alembic only — no 
 ## 28. User Flow
 
 ### 28.1 Demo flow
-Import 4–5 agents → recognize them → create workflow → deploy → start task → execute → intentionally trigger a capability gap (via `scripts/trigger_capability_gap.py`) → Web Research Agent checks for a free tool and finds the formula → if none, build → sandbox → test → verify (refined until ≥ 90%) → give capability to agent → resume exact step → complete final report.
+Import 4–5 agents → recognize them → create workflow → deploy → start task → execute → intentionally trigger a capability gap (via `scripts/trigger_capability_gap.py`) → web search checks for a free tool and finds the formula → if none, build → sandbox → test → verify (refined until ≥ 90%) → give capability to agent → resume exact step → complete final report.
 
 ### 28.2 Illustrative scenarios
 
@@ -860,7 +859,7 @@ Dashboard, agent registry, workflow graph, execution trace, step status, capabil
 | Master Agent / Supervisor | `orchestrator/master_agent.py` (inside Orchestrator service) | Week 3 (basic), Week 6 (wired) |
 | Step-Level Pause/Resume | `checkpoint_manager.py`; PostgreSQL Checkpoint table | Week 5 |
 | Failure Diagnosis | `master_agent.py` | Week 6 |
-| Capability Engine | `capability_engine/` (searcher, builder, sandbox, tester, verifier, registry) + `research_agent/` | Weeks 4–8 |
+| Capability Engine | `capability_engine/` (searcher, builder, sandbox, tester, verifier, registry) | Weeks 4–8 |
 | Deployment and Monitoring | Frontend dashboard; API Layer | Weeks 9–10 |
 
 ---
@@ -894,7 +893,7 @@ Decision: document and diagram supervision/diagnosis (Master Agent) as separate 
 Decision: pause and checkpoint only the failed step. Rationale: restarting a whole multi-step workflow after one failure wastes time/cost and re-runs already-successful agent work.
 
 **ADR-003 — Check for a Free/Accessible Tool Before Building One**
-Decision: always check for an existing free/accessible tool before invoking the Capability Engine's build path; this check is done by the Web Research Agent (ADR-011), which also returns the formula and worked examples used by the build and verify stages. Rationale: building/generating a tool is expensive and riskier; checking first avoids unnecessary generation.
+Decision: always check for an existing free/accessible tool before invoking the Capability Engine's build path; this check is done by web search in `searcher.py` (ADR-012), which also returns the formula and worked examples used by the build and verify stages. Rationale: building/generating a tool is expensive and riskier; checking first avoids unnecessary generation.
 
 **ADR-004 — Sandbox Before Trusting Any New/Generated Capability**
 Decision: every newly built or acquired capability runs in a separate Docker container before being trusted, regardless of any other MVP simplification. Rationale: a newly built or acquired capability is unverified code — isolation limits the blast radius of a bad or malicious tool. Treated as non-negotiable, unlike other MVP simplifications.
@@ -917,8 +916,11 @@ Decision: (1) every agent is registered by endpoint and must answer `GET /health
 **ADR-010 — Refine the Generated Tool Until Verified; Do Not Fine-Tune the LLM**
 Decision: (1) the LLM is used as-is through the API and is never retrained; (2) the Capability Engine refines the *generated tool* instead — each failed round's cases (input, returned value, expected value) are fed into the next build prompt, at most 3 rounds; (3) a tool is registered only at accuracy ≥ 90% over about 10 cases, 0 regressions against earlier-passing cases, and identical results over 3 runs per case; (4) after resume, the step's output is checked against the downstream step's `input_mapping` and fails as `OUTPUT_DRIFT` if it does not fit. Rationale: fine-tuning needs data, GPUs/special access and time the project does not have, and would not fix a single buggy attempt; targeted feedback does. The drift check guards the only output that can change after recovery, so downstream agents never receive broken input. Full explanation in `docs/final_flow.md` §5.3.
 
-**ADR-011 — A Web Research Agent Performs Web Search for the Capability Engine**
-Decision: (1) a system agent, the Web Research Agent, runs in its own container behind the standard `/health` + `/execute` contract and is called by `searcher.py` through the REST adapter; (2) it returns research notes — a free tool if one exists, the formula/definition, worked examples with answers, and sources; (3) notes feed the build prompt and become reference test cases for verification; (4) one call per gap, 30 s timeout, failure means "continue without notes"; web text is data, never instructions; found code is verified like built code; the sandbox keeps no network; notes are stored with the capability; pre-saved notes are used for the demo if the web is unavailable. Rationale: the LLM answers only from what it already knows; a separate agent keeps web access isolated, time-bounded and swappable, keeps the Master Agent's job unchanged, and supplies expected answers that do not come from the LLM whose code is being tested. Full explanation in `docs/final_flow.md` §5.4.
+**ADR-011 — A Web Research Agent Performs Web Search for the Capability Engine** — *SUPERSEDED by ADR-012*
+Decision (historical): (1) a system agent, the Web Research Agent, runs in its own container behind the standard `/health` + `/execute` contract and is called by `searcher.py` through the REST adapter; (2) it returns research notes — a free tool if one exists, the formula/definition, worked examples with answers, and sources; (3) notes feed the build prompt and become reference test cases for verification; (4) one call per gap, 30 s timeout, failure means "continue without notes"; web text is data, never instructions; found code is verified like built code; the sandbox keeps no network; notes are stored with the capability; pre-saved notes are used for the demo if the web is unavailable. Rationale: the LLM answers only from what it already knows; a separate agent keeps web access isolated, time-bounded and swappable, keeps the Master Agent's job unchanged, and supplies expected answers that do not come from the LLM whose code is being tested. Full explanation in `docs/final_flow.md` §5.4.
+
+**ADR-012 — Web Search Runs Inside the Searcher (Tavily + LLM Wrapper)** — *supersedes ADR-011*
+Decision: (1) `capability_engine/searcher.py` calls the Tavily search API with plain `httpx` and makes one call through the single LLM wrapper (P15) to turn the pages into research notes; (2) no separate agent, container or port 9005; (3) everything else from ADR-011 stays: notes = free tool, formula, worked examples, sources; one research per gap, 30 s limit for search + LLM call, failure means "continue without notes"; web text is data, never instructions; found code is verified like built code; the sandbox keeps no network; notes are stored with the capability; pre-saved demo notes. Rationale: same result as the agent with far less weight (no extra container, app or LLM setup), one LLM path, provider-independent, easy to test with a faked search. Trade-off: web access is not in its own container — acceptable because `searcher.py` only reads text. Full explanation in `docs/websearch.md`.
 
 ---
 

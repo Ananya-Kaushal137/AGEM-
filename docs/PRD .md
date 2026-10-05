@@ -163,7 +163,7 @@ As a developer, I want AGEM to tell me whether a failure was a normal error or a
 As a developer, I want AGEM to automatically find or build a missing tool, test and verify it, and hand it to my agent, so that my workflow can complete without me writing new code mid-run.
 
 **Acceptance criteria**
-- A free or already-accessible tool is always checked for before anything is built — by the Web Research Agent, which also returns the formula and worked examples used to build and verify the tool.
+- A free or already-accessible tool is always checked for before anything is built — by a web search (`searcher.py` + Tavily), which also returns the formula and worked examples used to build and verify the tool.
 - A tool is registered only at accuracy ≥ 90% on its test cases, with 0 regressions and consistent results; failing cases are fed back to the LLM for each repair. The LLM itself is not fine-tuned.
 - After the step resumes, its output is checked against what the next step needs; if it does not fit, the step is marked `FAILED` (`OUTPUT_DRIFT`) and the next agent never receives it.
 - A registered Capability row with a `verification_score` exists, and the paused step resumes and succeeds using it, with zero manual code deployment by the developer.

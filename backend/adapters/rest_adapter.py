@@ -8,7 +8,7 @@ import httpx
 from adapters.base_adapter import BaseAdapter
 
 # P11: every agent call is bounded. The docs fix no per-step agent timeout; 30 s
-# matches the only agent-call limit they do fix (the Web Research Agent, ADR-011).
+# matches the only other call limit they do fix (web research, docs/websearch.md).
 EXECUTE_TIMEOUT_SECONDS = 30.0
 HEALTH_TIMEOUT_SECONDS = 5.0
 

@@ -210,7 +210,7 @@ The **registry** is a list of tools AGEM has already built and checked.
 - File: `registry.py`
 
 #### Stage 1 — Web research
-The LLM cannot search the web by itself, so AGEM asks its own **Web Research Agent** (a system agent in its own container, called over HTTP like any other agent). It searches the web and returns **research notes**:
+The LLM cannot search the web by itself, so `searcher.py` searches the web itself: it calls the **Tavily** search API and then asks the LLM (through the one LLM wrapper) to turn the pages into **research notes** (details: `docs/websearch.md`):
 - a **free or open-source tool**, if one already does the job,
 - the **formula or definition** (for example, `A = P × (1 + r/n)^(n×t)`),
 - **worked examples** with correct answers,
@@ -220,9 +220,9 @@ What happens next:
 - A free tool is found → use it, **but it still goes through the safety checks** (Stages 3 to 6). A tool from the internet is not trusted just because it is free.
 - No free tool → go to Build, and give the LLM the formula from the notes.
 - The worked examples become **reference test cases** for Verify.
-- **One call, 30 seconds.** If research fails or times out, AGEM simply builds without notes. Research can never block recovery.
-- Text from the web is **data, never instructions**. The research agent never runs anything it finds.
-- Files: `searcher.py` (asks the agent) and the `research_agent/` folder
+- **One research per gap, 30 seconds.** If research fails or times out, AGEM simply builds without notes. Research can never block recovery.
+- Text from the web is **data, never instructions**. `searcher.py` only reads; it never runs anything it finds.
+- File: `searcher.py`
 
 #### Stage 2 — Build the tool
 The LLM **writes a small Python function** for the missing tool (for example, a compound-interest calculator), using the formula from the research notes.
@@ -367,7 +367,7 @@ MASTER AGENT — diagnose_failure()
                  0. Registry: already have it? → yes → go to 8
                                   │ no
                                   ▼
-                 1. Web Research Agent: free tool? formula? examples?
+                 1. Web search: free tool? formula? examples?
                         free tool found → go to 3
                                   │ not found
                                   ▼
@@ -403,7 +403,7 @@ MASTER AGENT — diagnose_failure()
 3. Only the Finance step is **paused**. The Research result stays safe.
 4. Master Agent, Stage 1 rule: `MISSING_CAPABILITY` → **CAPABILITY_GAP** (no LLM needed).
 5. Registry check: no calculator yet.
-6. Web research: no free tool, but the Web Research Agent brings back the compound-interest formula and worked examples (saved notes are used if the web is down).
+6. Web research: no free tool, but web search brings back the compound-interest formula and worked examples (saved notes are used if the web is down).
 7. Build: the LLM writes `calculate_compound_interest()` from the formula.
 8. Static check: passes.
 9. Sandbox + Test + Verify: refined until accuracy ≥ 90%, with no regression and consistent answers.
@@ -489,8 +489,7 @@ In normal automatic tests (CI), LLM calls are **faked (mocked)**, so tests are f
 | `backend/orchestrator/master_agent.py` | Diagnosis: rules first, then LLM |
 | `backend/orchestrator/orchestrator.py` | Decides what to do next and resumes the step |
 | `backend/capability_engine/engine.py` | Runs the capability stages in order |
-| `backend/capability_engine/searcher.py` | Asks the Web Research Agent for a free tool, formula and examples |
-| `research_agent/` | The Web Research Agent: searches the web, returns research notes |
+| `backend/capability_engine/searcher.py` | Searches the web (Tavily + LLM wrapper) for a free tool, formula and examples |
 | `backend/capability_engine/builder.py` | LLM writes the tool code; rewrites it using the failing cases |
 | `backend/capability_engine/sandbox.py` | Sends code to the sandbox |
 | `backend/capability_engine/tester.py` | Runs about 10 cases, each 3 times |
@@ -502,4 +501,4 @@ In normal automatic tests (CI), LLM calls are **faked (mocked)**, so tests are f
 
 ## 14. Short answer for the viva
 
-> "When a step fails, only that step pauses and a checkpoint is saved. The Master Agent, a function inside the Orchestrator, decides why it failed: obvious errors are handled by simple rules, and only unclear errors go to one LLM call that must reply in checked JSON. A normal error is retried up to 3 times. A capability gap goes to the Capability Engine: reuse the tool from the registry if we have it, otherwise a Web Research Agent searches the web for a free tool and the correct formula, otherwise the LLM builds one from those notes. Every new tool is safety-checked, run in a locked sandbox, tested and refined until it scores at least 90% with no regression and consistent answers, then saved in the registry. Finally, only the paused step resumes with the tool's result, and its output is checked so the next agent never gets bad data. Every loop has a limit, so nothing runs forever."
+> "When a step fails, only that step pauses and a checkpoint is saved. The Master Agent, a function inside the Orchestrator, decides why it failed: obvious errors are handled by simple rules, and only unclear errors go to one LLM call that must reply in checked JSON. A normal error is retried up to 3 times. A capability gap goes to the Capability Engine: reuse the tool from the registry if we have it, otherwise web search looks for a free tool and the correct formula, otherwise the LLM builds one from those notes. Every new tool is safety-checked, run in a locked sandbox, tested and refined until it scores at least 90% with no regression and consistent answers, then saved in the registry. Finally, only the paused step resumes with the tool's result, and its output is checked so the next agent never gets bad data. Every loop has a limit, so nothing runs forever."

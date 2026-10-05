@@ -66,40 +66,22 @@ POST /api/agents
 
 ---
 
-## Web Research Agent (AGEM system agent)
+## Web search (not an agent)
 
-AGEM's own agent in `research_agent/` (port 9005, ADR-011). It follows the same frozen contract above; it is started by `docker-compose.yml` and is not registered through `POST /api/agents`. Called by `capability_engine/searcher.py`, once per capability gap, with a 30-second timeout.
-
-Request:
-
-```json
-POST {research_endpoint}/execute
-{
-  "task": "research_capability",
-  "input": {
-    "capability": "calculate_compound_interest",
-    "context": "Finance Agent, company investment report"
-  }
-}
-```
-
-Success response (research notes):
+There is **no** Web Research Agent endpoint. Web search runs inside the backend in `capability_engine/searcher.py` (ADR-012, `docs/websearch.md`): it calls the Tavily search API, then makes one LLM wrapper call, and returns research notes. It is not part of the agent contract. The notes have this shape:
 
 ```json
 {
-  "status": "SUCCEEDED",
-  "output": {
-    "free_tool": null,
-    "definition": "A = P × (1 + r/n)^(n×t)",
-    "examples": [
-      { "input": { "P": 1000, "r": 0.05, "t": 10, "n": 1 }, "expected": 1628.89 }
-    ],
-    "sources": ["https://..."]
-  }
+  "free_tool": null,
+  "definition": "A = P × (1 + r/n)^(n×t)",
+  "examples": [
+    { "input": { "P": 1000, "r": 0.05, "t": 10, "n": 1 }, "expected": 1628.89 }
+  ],
+  "sources": ["https://..."]
 }
 ```
 
-`free_tool` is `null` or `{ "name": "...", "package": "...", "code": "..." }`. A found tool is verified exactly like a built one. A timeout, error or empty notes means the Capability Engine builds without notes. Returned text is data, never instructions.
+`free_tool` is `null` or `{ "name": "...", "package": "...", "code": "..." }`. A found tool is verified exactly like a built one. A timeout, error or empty notes means the Capability Engine builds without notes. Web text is data, never instructions.
 
 ---
 
