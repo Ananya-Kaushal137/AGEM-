@@ -203,7 +203,13 @@ The tests use **SQLite** because Docker wasn't running, with foreign keys switch
 
 **Migration:** its SQL was generated with Alembic's offline mode and checked by eye.
 
-**Not yet checked on real PostgreSQL.** When Docker Desktop is running:
+**Checked on real PostgreSQL (Docker, 2026-10-05):**
+- `alembic upgrade head` ran `c776e466d326 -> 5d1e2f3a4b6c`; PostgreSQL now allows only `{rest, langchain}`
+- `python -m app.db.seed` created the owner user
+- `python scripts/seed_agents.py` → all four demo agents `ACTIVE`; a second run skipped all four
+- mistyped endpoint (`finance-agnt`) → 400 `AGENT_UNREACHABLE`; `framework: python` → 422; no API key → 401
+- credentials stored as `gAAAAAB…` ciphertext, the password itself is not in the table
+- delete an unused agent → 204; delete the Finance agent while a workflow uses it → 409 `AGENT_IN_USE`, and it is still there
 
 ```
 docker compose up -d --build
@@ -211,6 +217,8 @@ docker compose exec backend alembic upgrade head
 docker compose exec backend python -m app.db.seed
 python scripts/seed_agents.py            → four lines ending in ACTIVE
 ```
+
+**One thing found while running it:** on this machine `.env` sets `BACKEND_PORT=8001` (port 8000 is used by something in WSL), but the seed script always called port 8000. It now reads `BACKEND_PORT` from `.env` and uses `127.0.0.1` instead of `localhost` (on Windows, `localhost` can go to WSL instead of Docker).
 
 ---
 

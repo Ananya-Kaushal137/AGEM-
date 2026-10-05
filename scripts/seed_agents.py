@@ -5,8 +5,9 @@ Run on your machine after `docker compose up -d`:
     python scripts/seed_agents.py
 
 Safe to run again: an agent whose name is already registered is skipped.
-Uses only the standard library, so it needs no install. The API key is read
-from the API_KEY environment variable, or from the repo's `.env`.
+Uses only the standard library, so it needs no install. API_KEY and
+BACKEND_PORT are read from the environment, or from the repo's `.env`; set
+AGEM_URL to override the address completely.
 """
 
 import json
@@ -15,8 +16,6 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-
-AGEM_URL = os.environ.get("AGEM_URL", "http://localhost:8000")
 
 # Endpoints as the backend container sees them (compose service names).
 DEMO_AGENTS = [
@@ -31,15 +30,24 @@ DEMO_AGENTS = [
 ]
 
 
-def _api_key() -> str:
-    if os.environ.get("API_KEY"):
-        return os.environ["API_KEY"]
+def _env(name: str) -> str | None:
+    if os.environ.get(name):
+        return os.environ[name]
     env = Path(__file__).resolve().parents[1] / ".env"
     if env.exists():
         for line in env.read_text().splitlines():
-            if line.startswith("API_KEY="):
-                return line.split("=", 1)[1].split("#")[0].strip()
-    sys.exit("API_KEY not found: set it in the environment or in .env")
+            if line.startswith(f"{name}="):
+                return line.split("=", 1)[1].split("#")[0].strip() or None
+    return None
+
+
+def _api_key() -> str:
+    return _env("API_KEY") or sys.exit("API_KEY not found: set it in the environment or in .env")
+
+
+# 127.0.0.1, not localhost: on Windows, localhost can resolve to an IPv6 port
+# held by another program (e.g. WSL) instead of Docker.
+AGEM_URL = _env("AGEM_URL") or f"http://127.0.0.1:{_env('BACKEND_PORT') or 8000}"
 
 
 def _call(method: str, path: str, body: dict | None = None) -> tuple[int, object]:
