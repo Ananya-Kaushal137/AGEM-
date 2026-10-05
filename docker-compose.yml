@@ -85,5 +85,32 @@ services:
   # No separate research container: web search runs inside the backend in
   # capability_engine/searcher.py (docs/websearch.md). The sandbox above keeps no network.
 
+  # DEMO AGENTS — stand-ins for a developer's existing agents, each behind
+  # python_wrapper.py in its own container (ports 9001–9004). AGEM reaches them
+  # only over HTTP; scripts/seed_agents.py registers them via POST /api/agents.
+  research-agent:
+    build: { context: ., dockerfile: demo_agents/Dockerfile }
+    container_name: agem-research-agent
+    command: ["python", "python_wrapper.py", "research:run", "--port", "9001"]
+    ports: ["9001:9001"]
+
+  finance-agent:
+    build: { context: ., dockerfile: demo_agents/Dockerfile }
+    container_name: agem-finance-agent
+    command: ["python", "python_wrapper.py", "finance:run", "--port", "9002"]
+    ports: ["9002:9002"]
+
+  fact-checker-agent:
+    build: { context: ., dockerfile: demo_agents/Dockerfile }
+    container_name: agem-fact-checker-agent
+    command: ["python", "python_wrapper.py", "fact_checker:run", "--port", "9003"]
+    ports: ["9003:9003"]
+
+  writer-agent:
+    build: { context: ., dockerfile: demo_agents/Dockerfile }
+    container_name: agem-writer-agent
+    command: ["python", "python_wrapper.py", "writer:run", "--port", "9004"]
+    ports: ["9004:9004"]
+
 volumes:
   postgres_data:

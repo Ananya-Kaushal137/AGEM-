@@ -62,12 +62,13 @@ class Agent(Base, TimestampMixin):
 
     user: Mapped["User"] = relationship(back_populates="agents")
     # No cascade on either side: an agent referenced by a workflow cannot be
-    # deleted, which is what produces the 409 in FR-AGT-006.
+    # deleted, which is what produces the 409 in FR-AGT-006. passive_deletes="all"
+    # stops the ORM nulling these rows first, so the RESTRICT foreign key decides.
     workflow_agents: Mapped[list["WorkflowAgent"]] = relationship(
-        back_populates="agent"
+        back_populates="agent", passive_deletes="all"
     )
     execution_steps: Mapped[list["ExecutionStep"]] = relationship(
-        back_populates="agent"
+        back_populates="agent", passive_deletes="all"
     )
     capabilities: Mapped[list["AgentCapability"]] = relationship(
         back_populates="agent",

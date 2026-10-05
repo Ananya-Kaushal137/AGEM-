@@ -27,6 +27,8 @@ KEY = "test-key-" + "x" * 32
 CATALOGUE = {
     "VALIDATION_ERROR": 422,
     "AGENT_NOT_FOUND": 404,
+    "AGENT_IN_USE": 409,
+    "AGENT_UNREACHABLE": 400,
     "WORKFLOW_NOT_FOUND": 404,
     "EXECUTION_NOT_FOUND": 404,
     "CAPABILITY_NOT_FOUND": 404,
@@ -232,3 +234,176 @@ def test_secrets_never_appear_in_settings_repr(monkeypatch):
     get_settings.cache_clear()
     text = repr(get_settings())
     assert KEY not in text and "sk-very-secret" not in text and "fernet-very-secret" not in text
+
+
+# --- Agent registration (Prompt 5: FR-AGT-001…011, US-01, US-15) -------------
+#
+# The full schema is Postgres-only because of JSONB; for these tests JSONB is
+# compiled as SQLite JSON and foreign keys are switched on, so ON DELETE
+# RESTRICT is enforced by the database exactly as in Postgres.
+
+import socket  # noqa: E402
+import sys  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import uvicorn  # noqa: E402
+from cryptography.fernet import Fernet  # noqa: E402
+from fastapi import FastAPI, Header  # noqa: E402
+from sqlalchemy import event  # noqa: E402
+from sqlalchemy.dialects.postgresql import JSONB  # noqa: E402
+from sqlalchemy.ext.compiler import compiles  # noqa: E402
+from sqlalchemy.pool import StaticPool  # noqa: E402
+
+from app.core.crypto import decrypt  # noqa: E402
+from app.db.database import get_db  # noqa: E402
+from app.models import Agent, Base, Workflow, WorkflowAgent  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "agent_wrappers"))
+from python_wrapper import create_app as wrap_agent  # noqa: E402
+
+
+@compiles(JSONB, "sqlite")
+def _jsonb_on_sqlite(type_, compiler, **kw):
+    return "JSON"
+
+
+def _serve(app: FastAPI) -> tuple[str, uvicorn.Server]:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+    threading.Thread(target=server.run, daemon=True).start()
+    deadline = time.monotonic() + 10
+    while not server.started:
+        if time.monotonic() > deadline:
+            raise RuntimeError("test agent did not start")
+        time.sleep(0.02)
+    return f"http://127.0.0.1:{port}", server
+
+
+def _free_port_url() -> str:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return f"http://127.0.0.1:{s.getsockname()[1]}"
+
+
+def _locked_agent() -> FastAPI:
+    """Answers /health only with the right Bearer token, to prove credentials are sent."""
+    app = FastAPI()
+
+    @app.get("/health")
+    def health(authorization: str | None = Header(default=None)):
+        from fastapi.responses import JSONResponse
+
+        if authorization != "Bearer agent-secret-123":
+            return JSONResponse({"detail": "no"}, status_code=401)
+        return {"ok": True}
+
+    return app
+
+
+@pytest.fixture(scope="module")
+def agent_url():
+    url, server = _serve(wrap_agent(lambda task, input, context: {"ok": True}))
+    yield url
+    server.should_exit = True
+
+
+@pytest.fixture(scope="module")
+def locked_url():
+    url, server = _serve(_locked_agent())
+    yield url
+    server.should_exit = True
+
+
+@pytest.fixture
+def agent_db(monkeypatch):
+    monkeypatch.setenv("FERNET_KEY", Fernet.generate_key().decode())
+    get_settings.cache_clear()
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    event.listen(engine, "connect", lambda conn, _: conn.execute("PRAGMA foreign_keys=ON"))
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as session:
+        yield session
+
+
+@pytest.fixture
+def api(agent_db):
+    app = create_app()
+    app.dependency_overrides[get_db] = lambda: agent_db
+    return TestClient(app, raise_server_exceptions=False, headers={"X-API-Key": KEY})
+
+
+def _register(api, url, **extra):
+    return api.post("/api/agents", json={"name": "Finance", "framework": "rest", "endpoint": url, **extra})
+
+
+def test_register_a_running_agent_as_active(api, agent_url):
+    resp = _register(api, agent_url, description="does finance")
+    assert resp.status_code == 201
+    agent = resp.json()
+    assert agent["status"] == "ACTIVE" and agent["framework"] == "rest"
+    assert agent["endpoint"] == agent_url and agent["has_credentials"] is False
+    assert [a["agent_id"] for a in api.get("/api/agents").json()] == [agent["agent_id"]]
+    detail = api.get(f"/api/agents/{agent['agent_id']}").json()
+    # SQLite drops the timezone on read-back (Postgres keeps it), so skip timestamps.
+    assert {k: v for k, v in detail.items() if not k.endswith("_at")} == {
+        k: v for k, v in agent.items() if not k.endswith("_at")
+    }
+
+
+def test_unreachable_endpoint_is_rejected_and_not_saved(api, agent_db):
+    resp = _register(api, _free_port_url())
+    assert_envelope(resp, 400, "AGENT_UNREACHABLE")
+    assert agent_db.scalar(select(func.count()).select_from(Agent)) == 0
+
+
+@pytest.mark.parametrize("framework", ["python", "crewai", "autogen", "REST"])
+def test_unknown_framework_is_rejected_at_registration(api, agent_url, framework):
+    resp = api.post("/api/agents", json={"name": "A", "framework": framework, "endpoint": agent_url})
+    assert_envelope(resp, 422, "VALIDATION_ERROR")
+
+
+def test_langchain_is_an_accepted_framework(api, agent_url):
+    assert _register(api, agent_url, framework="langchain").status_code == 201
+
+
+@pytest.mark.parametrize("bad", [{"endpoint": "not a url"}, {"name": ""}, {"source_code": "print(1)"}])
+def test_invalid_registration_body_is_422(api, agent_url, bad):
+    body = {"name": "A", "framework": "rest", "endpoint": agent_url, **bad}
+    assert_envelope(api.post("/api/agents", json=body), 422, "VALIDATION_ERROR")
+
+
+def test_credentials_are_encrypted_sent_and_never_echoed(api, agent_db, locked_url):
+    assert_envelope(_register(api, locked_url), 400, "AGENT_UNREACHABLE")
+
+    resp = _register(api, locked_url, credentials="agent-secret-123")
+    assert resp.status_code == 201 and resp.json()["has_credentials"] is True
+    stored = agent_db.scalars(select(Agent)).one().encrypted_credentials
+    assert "agent-secret-123" not in stored and decrypt(stored) == "agent-secret-123"
+    for r in (resp, api.get("/api/agents"), api.get(f"/api/agents/{resp.json()['agent_id']}")):
+        assert "agent-secret-123" not in r.text and stored not in r.text
+
+
+def test_unknown_agent_is_404(api):
+    assert_envelope(api.get(f"/api/agents/{uuid.uuid4()}"), 404, "AGENT_NOT_FOUND")
+    assert_envelope(api.delete(f"/api/agents/{uuid.uuid4()}"), 404, "AGENT_NOT_FOUND")
+
+
+def test_delete_an_unused_agent(api, agent_url):
+    agent_id = _register(api, agent_url).json()["agent_id"]
+    assert api.delete(f"/api/agents/{agent_id}").status_code == 204
+    assert_envelope(api.get(f"/api/agents/{agent_id}"), 404, "AGENT_NOT_FOUND")
+
+
+def test_delete_an_agent_used_by_a_workflow_is_409(api, agent_db, agent_url):
+    agent_id = _register(api, agent_url).json()["agent_id"]
+    agent = agent_db.get(Agent, uuid.UUID(agent_id))
+    workflow = Workflow(user_id=agent.user_id, name="Report")
+    agent_db.add_all([workflow, WorkflowAgent(workflow=workflow, agent_id=agent.agent_id, step_order=1)])
+    agent_db.commit()
+
+    assert_envelope(api.delete(f"/api/agents/{agent_id}"), 409, "AGENT_IN_USE")
+    assert api.get(f"/api/agents/{agent_id}").status_code == 200

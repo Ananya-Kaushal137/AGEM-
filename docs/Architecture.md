@@ -271,6 +271,8 @@ Semantic HTML elements over generic divs, visible keyboard focus states, labelle
 |---|---|---|
 | `VALIDATION_ERROR` | 422 | Pydantic schema validation failure on any request body |
 | `AGENT_NOT_FOUND` / `WORKFLOW_NOT_FOUND` / `EXECUTION_NOT_FOUND` / `CAPABILITY_NOT_FOUND` | 404 | Lookup by ID fails |
+| `AGENT_IN_USE` | 409 | `DELETE /api/agents/{id}` on an agent a workflow still references (`ON DELETE RESTRICT`) |
+| `AGENT_UNREACHABLE` | 400 | Registration: the agent's `GET /health` did not answer 200 (FR-AGT-011) |
 | `WORKFLOW_CYCLE_DETECTED` | 400 | Workflow creation rejected because the declared dependencies are not a valid DAG |
 | `UNAUTHORIZED` | 401 | Missing or invalid `X-API-Key` header |
 | `CAPABILITY_BUILD_FAILED` | 500 | The Capability Engine exhausted its repair-attempt limit without producing a verified capability |
@@ -283,7 +285,7 @@ Semantic HTML elements over generic divs, visible keyboard focus states, labelle
 | `POST /api/agents` | Register an agent | Returns the created Agent with status `ACTIVE` |
 | `GET /api/agents` | List agents | Backs the Agents page table |
 | `GET /api/agents/{agent_id}` | Agent detail | `404 AGENT_NOT_FOUND` if missing |
-| `DELETE /api/agents/{agent_id}` | Remove an agent | `409` if referenced by an active workflow |
+| `DELETE /api/agents/{agent_id}` | Remove an agent | `409 AGENT_IN_USE` if referenced by an active workflow |
 | `POST /api/workflows` | Create a workflow definition | Validated as a DAG at creation time |
 | `GET /api/workflows` | List workflows | Backs the Workflows page |
 | `GET /api/workflows/{workflow_id}` | Workflow detail | Includes the DAG structure consumed directly by React Flow |

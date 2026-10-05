@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-sqlalchemy
+sqlalchemy>=2.0,<2.1  # 2.1 switched the default Postgres driver to psycopg 3; we use psycopg2
 psycopg2-binary
 alembic
 tzdata  # alembic.ini sets timezone = UTC; zoneinfo needs this on Windows

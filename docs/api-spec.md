@@ -62,6 +62,8 @@ POST /api/agents
 }
 ```
 
+If `credentials` are given, AGEM sends them to the agent on every call (`/health` and `/execute`) as the header `Authorization: Bearer <credentials>`. Registration calls `GET /health` first; no 200 → `400 AGENT_UNREACHABLE`, nothing saved. `framework` is `rest` or `langchain`.
+
 `framework` is one of `rest`, `langchain` or `crewai` (whichever adapter is built), and `mcp` only if the MCP adapter is built.
 
 ---

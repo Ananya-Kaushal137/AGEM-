@@ -16,9 +16,11 @@ CONTRACT_STATUSES = {"SUCCEEDED", "FAILED"}
 
 
 class RestAdapter(BaseAdapter):
-    def __init__(self, endpoint: str, timeout: float = EXECUTE_TIMEOUT_SECONDS):
+    def __init__(self, endpoint: str, timeout: float = EXECUTE_TIMEOUT_SECONDS, credentials: str | None = None):
         self.endpoint = endpoint.rstrip("/")
         self.timeout = timeout
+        # Decrypted Agent.encrypted_credentials, sent on every call (docs/api-spec.md).
+        self.headers = {"Authorization": f"Bearer {credentials}"} if credentials else {}
 
     async def execute(self, input: dict) -> dict:
         """POST `{task, input, context}` to `{endpoint}/execute`.
@@ -28,7 +30,7 @@ class RestAdapter(BaseAdapter):
         `step_executor.py` maps these to TIMEOUT, CONNECTION_ERROR, HTTP_5XX /
         AGENT_ERROR and INVALID_JSON.
         """
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, headers=self.headers) as client:
             response = await client.post(f"{self.endpoint}/execute", json=input)
         response.raise_for_status()
         reply = response.json()
@@ -39,7 +41,7 @@ class RestAdapter(BaseAdapter):
     async def health(self) -> bool:
         """True only if `GET {endpoint}/health` answers 200 (FR-AGT-011). Never raises."""
         try:
-            async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT_SECONDS) as client:
+            async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT_SECONDS, headers=self.headers) as client:
                 response = await client.get(f"{self.endpoint}/health")
         except httpx.HTTPError:
             return False

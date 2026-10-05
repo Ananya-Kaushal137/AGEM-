@@ -91,12 +91,14 @@ class CapabilityStatus(str, Enum):
 
 
 class AgentFramework(str, Enum):
-    """`Agent.framework` — validated at registration, not at execution (FR-AGT-002)."""
+    """`Agent.framework` — validated at registration, not at execution (FR-AGT-002).
 
-    PYTHON = "python"
+    Only frameworks with a built adapter: `rest` (plain Python agents too, behind
+    `python_wrapper.py`) and `langchain` (the one framework adapter, Prompt 15).
+    """
+
     REST = "rest"
     LANGCHAIN = "langchain"
-    CREWAI = "crewai"
 
 
 class CapabilitySource(str, Enum):
