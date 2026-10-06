@@ -60,7 +60,7 @@ A copy-paste prompt per build step, sequenced to the 12-week Roadmap (FRS §10 �
 >
 > **Done when:** `docker-compose up` starts all four services and the directory tree matches Architecture §25 file for file.
 >
-> **Do NOT:** add Redis, Celery, Kubernetes, or a CI workflow yet — Architecture §30 marks Redis/Celery OPTIONAL and not before Week 8, and CI is Prompt 18.
+> **Do NOT:** add Redis, Celery, Kubernetes, or a CI workflow yet — Architecture §30 marks Redis/Celery OPTIONAL and not before Week 8, and CI is Prompt 19.
 
 ## Prompt 2 — Database schema and SQLAlchemy models
 

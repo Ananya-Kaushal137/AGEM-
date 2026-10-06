@@ -112,6 +112,22 @@ class CapabilitySource(str, Enum):
     ACQUIRED = "ACQUIRED"
 
 
+class ErrorType(str, Enum):
+    """`error_type` of a normalised step failure — the fixed set in Architecture §23.1 / FR-DIAG-002.
+
+    `step_executor.py` (Prompt 8) maps every exception and agent error onto one of
+    these; `master_agent.py`'s diagnosis rules match on them. Anything else is
+    `AGENT_ERROR`, which the rules leave to the LLM.
+    """
+
+    MISSING_CAPABILITY = "MISSING_CAPABILITY"
+    TIMEOUT = "TIMEOUT"
+    CONNECTION_ERROR = "CONNECTION_ERROR"
+    HTTP_5XX = "HTTP_5XX"
+    INVALID_JSON = "INVALID_JSON"
+    AGENT_ERROR = "AGENT_ERROR"
+
+
 # --- Step state machine (Architecture §15.1) --------------------------------
 #
 #   [*] --> PENDING

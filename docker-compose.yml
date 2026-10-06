@@ -35,6 +35,9 @@ services:
       API_KEY: ${API_KEY}
       LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
       LLM_API_KEY: ${LLM_API_KEY}
+      LLM_MODEL_CHEAP: ${LLM_MODEL_CHEAP:-}
+      LLM_MODEL_STRONG: ${LLM_MODEL_STRONG:-}
+      LLM_LOG_PAYLOADS: ${LLM_LOG_PAYLOADS:-false}
       FERNET_KEY: ${FERNET_KEY}
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-agem-sandbox-runner:latest}
     volumes:

@@ -22,7 +22,7 @@ Prompt 4 built the "telephone": the two sides of every call between AGEM and an 
 | Prompt 4 built | What it does | How Prompt 5 uses it |
 |---|---|---|
 | `adapters/rest_adapter.py` → `health()` | Calls `GET {endpoint}/health`, returns True/False, never crashes | **Registration calls it before saving.** No 200 → the agent is rejected (FR-AGT-011). This is the first real user of `health()`, which is exactly what `prompt4.md` said ("Use `RestAdapter(endpoint).health()` for FR-AGT-011") |
-| `adapters/rest_adapter.py` → `execute()` | Calls `POST {endpoint}/execute` | Not used by Prompt 5 itself. The orchestrator uses it later (Prompt 9). The demo agents were tested through it |
+| `adapters/rest_adapter.py` → `execute()` | Calls `POST {endpoint}/execute` | Not used by Prompt 5 itself. The orchestrator uses it later (Prompt 8). The demo agents were tested through it |
 | `agent_wrappers/python_wrapper.py` | Turns a plain Python function into an agent with `/health` + `/execute` | **All four demo agents run behind it**, unchanged. That's the proof that an agent's own code never changes |
 | `MissingToolError` in the wrapper | Turns "I lack a tool" into `{"status":"FAILED","error":"MISSING_CAPABILITY",...}` | **The Finance demo agent raises it** when `calculate_compound_interest` is missing, which starts the whole capability-gap story later |
 | Open question #3 in `prompt4.md`: "Agent credentials are not sent yet… needs a decision before or during Prompt 5" | — | **Answered in Prompt 5:** credentials are sent as `Authorization: Bearer <credentials>`, and `RestAdapter` now does it |
@@ -225,7 +225,7 @@ python scripts/seed_agents.py            → four lines ending in ACTIVE
 ## 8. What Prompt 5 does NOT do (comes later)
 
 - "An `INACTIVE` agent can't be added to a new workflow" is checked when workflows are created (**Prompt 7**).
-- Actually **running** agents in a workflow with `execute()` is **Prompt 9**.
+- Actually **running** agents in a workflow with `execute()` is **Prompt 8**.
 - The LangChain adapter is **Prompt 15**. `langchain` is already an accepted framework name.
 
 ---

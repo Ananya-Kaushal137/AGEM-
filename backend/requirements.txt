@@ -9,6 +9,8 @@ pydantic-settings
 python-dotenv
 cryptography
 httpx
+anthropic  # LLM provider SDKs: imported only in app/core/llm.py (FR-DIAG-009)
+openai
 docker
 pytest
 pytest-cov

@@ -26,6 +26,12 @@ class Settings(BaseSettings):
 
     llm_provider: Literal["anthropic", "openai"] = "anthropic"
     llm_api_key: SecretStr = SecretStr("")
+    # FR-DIAG-008. Empty means the provider default in app/core/llm.py:
+    # cheap tier for diagnosis, strong tier for code generation.
+    llm_model_cheap: str = ""
+    llm_model_strong: str = ""
+    # FR-AUTH-006: debug only. On, LLM prompts and replies (which carry agent payloads) are logged.
+    llm_log_payloads: bool = False
 
     # FR-AUTH-005: encrypts Agent.encrypted_credentials at rest.
     fernet_key: SecretStr = SecretStr("")

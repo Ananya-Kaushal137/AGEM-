@@ -744,7 +744,7 @@ agem/
 │   │   ├── models/         SQLAlchemy models
 │   │   ├── schemas/        Pydantic request/response schemas
 │   │   ├── db/              database.py · seed.py
-│   │   └── core/            config.py — env vars, settings
+│   │   └── core/            config.py — env vars, settings · llm.py — the single LLM wrapper (P15)
 │   │
 │   ├── orchestrator/
 │   │   ├── orchestrator.py         runs DAG, manages step execution
