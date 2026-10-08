@@ -247,3 +247,33 @@ def test_backend_never_imports_agent_wrappers():
         if "tests" not in path.relative_to(BACKEND).parts[:1] and pattern.search(path.read_text(encoding="utf-8"))
     ]
     assert offenders == []
+
+
+def test_wrapper_run_as_a_script_still_reports_missing_capability(tmp_path):
+    """`python python_wrapper.py agent:run` loads the wrapper twice (as __main__ and as
+    an import); the agent's MissingToolError must still become MISSING_CAPABILITY."""
+    import subprocess
+
+    (tmp_path / "needs_tool.py").write_text(
+        "from python_wrapper import MissingToolError\n"
+        "def run(task, input, context):\n"
+        "    raise MissingToolError('calculate_compound_interest')\n"
+    )
+    wrapper = BACKEND.parent / "agent_wrappers" / "python_wrapper.py"
+    url = _free_port_url()
+    port = url.rsplit(":", 1)[1]
+    env = {**__import__("os").environ,
+           "PYTHONPATH": f"{tmp_path}{__import__('os').pathsep}{wrapper.parent}"}
+    proc = subprocess.Popen([sys.executable, str(wrapper), "needs_tool:run", "--host", "127.0.0.1", "--port", port],
+                            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 15
+        while not _run(RestAdapter(url).health()):
+            if time.monotonic() > deadline:
+                raise RuntimeError("wrapper script did not start")
+            time.sleep(0.1)
+        reply = _run(RestAdapter(url).execute(REQUEST))
+        assert reply == {"status": "FAILED", "error": "MISSING_CAPABILITY", "capability": "calculate_compound_interest"}
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)

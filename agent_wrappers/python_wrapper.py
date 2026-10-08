@@ -75,4 +75,10 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=9001)
     args = parser.parse_args()
-    uvicorn.run(create_app(load_agent(args.agent)), host=args.host, port=args.port)
+    # Run as a script, this file is `__main__`; an agent that does
+    # `from python_wrapper import MissingToolError` gets a second copy with a
+    # different class, which `except MissingToolError` here would not catch.
+    # Serving from the imported module keeps one class for both sides.
+    import python_wrapper
+
+    uvicorn.run(python_wrapper.create_app(load_agent(args.agent)), host=args.host, port=args.port)
