@@ -55,6 +55,11 @@ class Execution(Base, TimestampMixin):
         nullable=False,
         default=ExecutionStatus.PENDING,
     )
+    # What the user asked for and the starting values, given when the run is
+    # started. `task` goes to every agent; `input` is what an input_mapping
+    # `"from": "input"` reads (FR-ORC-005, FR-ORC-006).
+    task: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    input: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

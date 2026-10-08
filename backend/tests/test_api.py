@@ -532,3 +532,119 @@ def test_unknown_workflow_is_404(api):
 def test_an_agent_in_a_workflow_cannot_be_deleted(api, agents):
     api.post("/api/workflows", json=_wf([_step("f", agents["Finance"])]))
     assert_envelope(api.delete(f"/api/agents/{agents['Finance']}"), 409, "AGENT_IN_USE")
+
+
+# --- Starting an execution (Prompt 8: FR-ORC-001, US-04) ---------------------
+#
+# Real agents over real HTTP, behind the Python wrapper. TestClient runs the
+# background task before handing back the response, so the run has finished
+# by the time the assertions read the database.
+
+from python_wrapper import MissingToolError  # noqa: E402
+
+from app.models import Execution  # noqa: E402
+from app.models.enums import WorkflowStatus  # noqa: E402
+
+CALLS: list[str] = []
+
+
+def _research(task, input, context):
+    CALLS.append("Research")
+    return {"company": input["company"], "revenue": 96.77, "profit": 14.97}
+
+
+def _writer(task, input, context):
+    CALLS.append("Writer")
+    return {"report": f"{task} — {input['company']}: revenue {input['revenue']}"}
+
+
+def _finance(task, input, context):
+    CALLS.append("Finance")
+    raise MissingToolError("calculate_compound_interest")
+
+
+@pytest.fixture(scope="module")
+def demo_urls():
+    servers = {name: _serve(wrap_agent(fn)) for name, fn in
+               {"Research": _research, "Writer": _writer, "Finance": _finance}.items()}
+    yield {name: url for name, (url, _) in servers.items()}
+    for _, server in servers.values():
+        server.should_exit = True
+
+
+@pytest.fixture
+def demo(api, demo_urls):
+    CALLS.clear()
+    return {name: _register(api, url, name=name).json()["agent_id"] for name, url in demo_urls.items()}
+
+
+def _execution(agent_db, execution_id) -> Execution:
+    agent_db.expire_all()
+    return agent_db.get(Execution, uuid.UUID(execution_id))
+
+
+def test_a_two_agent_workflow_runs_end_to_end(api, agent_db, demo):
+    """Prompt 8 done-when: Research → Writer runs in declared order, output feeding input (US-04)."""
+    wf = api.post("/api/workflows", json=_wf([
+        _step("writer", demo["Writer"], ["research"], company=("research", "company", "string"),
+              revenue=("research", "revenue", "number")),
+        _step("research", demo["Research"], company=("input", "company", "string")),
+    ])).json()
+
+    resp = api.post(f"/api/workflows/{wf['workflow_id']}/executions",
+                    json={"task": "Investment report", "input": {"company": "Tesla"}})
+    assert resp.status_code == 202
+    assert set(resp.json()) == {"execution_id", "status"} and resp.json()["status"] == "PENDING"
+
+    execution = _execution(agent_db, resp.json()["execution_id"])
+    assert CALLS == ["Research", "Writer"]
+    assert execution.status.value == "SUCCEEDED"
+    research, writer = execution.steps
+    assert [research.status.value, writer.status.value] == ["SUCCEEDED", "SUCCEEDED"]
+    assert writer.input == {"company": "Tesla", "revenue": 96.77}
+    assert execution.final_output == {"report": "Investment report — Tesla: revenue 96.77"}
+    assert execution.task == "Investment report" and execution.input == {"company": "Tesla"}
+
+
+def test_a_missing_tool_ends_the_step_failed_for_now(api, agent_db, demo):
+    """Until Prompt 11 adds pause and diagnosis, the normalised error is stored and the run stops."""
+    wf = api.post("/api/workflows", json=_wf([
+        _step("research", demo["Research"], company=("input", "company", "string")),
+        _step("finance", demo["Finance"], ["research"], revenue=("research", "revenue", "number")),
+    ])).json()
+    execution_id = api.post(f"/api/workflows/{wf['workflow_id']}/executions",
+                            json={"task": "t", "input": {"company": "Tesla"}}).json()["execution_id"]
+
+    execution = _execution(agent_db, execution_id)
+    assert execution.status.value == "FAILED"
+    assert execution.steps[1].error == {"status": "FAILED", "error_type": "MISSING_CAPABILITY",
+                                        "raw_error": "MISSING_CAPABILITY", "capability": "calculate_compound_interest"}
+
+
+def test_an_unreachable_agent_is_a_connection_error(api, agent_db, demo):
+    wf = api.post("/api/workflows", json=_wf([_step("r", demo["Research"])])).json()
+    agent_db.get(Agent, uuid.UUID(demo["Research"])).endpoint = _free_port_url()
+    agent_db.commit()
+    execution_id = api.post(f"/api/workflows/{wf['workflow_id']}/executions", json={"task": "t"}).json()["execution_id"]
+    assert _execution(agent_db, execution_id).steps[0].error["error_type"] == "CONNECTION_ERROR"
+
+
+def test_starting_an_unknown_workflow_is_404(api):
+    resp = api.post(f"/api/workflows/{uuid.uuid4()}/executions", json={"task": "t"})
+    assert_envelope(resp, 404, "WORKFLOW_NOT_FOUND")
+
+
+def test_only_an_active_workflow_starts(api, agent_db, demo):
+    wf = api.post("/api/workflows", json=_wf([_step("r", demo["Research"])])).json()
+    agent_db.get(Workflow, uuid.UUID(wf["workflow_id"])).status = WorkflowStatus.ARCHIVED
+    agent_db.commit()
+    assert_envelope(api.post(f"/api/workflows/{wf['workflow_id']}/executions", json={"task": "t"}),
+                    422, "VALIDATION_ERROR")
+    assert agent_db.scalar(select(func.count()).select_from(Execution)) == 0
+
+
+@pytest.mark.parametrize("body", [{}, {"task": ""}, {"task": "t", "input": []}, {"task": "t", "extra": 1}],
+                         ids=["no-task", "empty-task", "input-not-object", "unknown-field"])
+def test_a_bad_execution_body_is_422(api, demo, body):
+    wf = api.post("/api/workflows", json=_wf([_step("r", demo["Research"])])).json()
+    assert_envelope(api.post(f"/api/workflows/{wf['workflow_id']}/executions", json=body), 422, "VALIDATION_ERROR")

@@ -111,6 +111,22 @@ Steps are named by a short `key` you choose; AGEM turns keys into `workflow_agen
 
 ---
 
+## Starting an execution (`POST /api/workflows/{id}/executions`)
+
+```json
+{ "task": "Create a company investment report", "input": { "company": "Tesla" } }
+```
+
+→ `202 { "execution_id": "<uuid>", "status": "PENDING" }` at once; the run continues in the background (FR-ORC-001).
+
+- `task` (required, non-empty) is sent to every agent as `task`. `input` (optional object) is what a step's `"from": "input"` mapping reads.
+- A step's `input` holds **only** the fields its `input_mapping` declares; upstream values are read from the upstream step's checkpoint. `context` is `{}` until a step resumes after a verified capability.
+- Errors: unknown workflow → `404 WORKFLOW_NOT_FOUND`; a workflow that is not `ACTIVE` or a malformed body → `422 VALIDATION_ERROR`.
+- If a mapped field is missing from the upstream output, the step fails with `AGENT_ERROR` without calling its agent.
+- `Execution.final_output` is the output of the last step; when several steps have nothing after them, it is `{ "<step key>": output, ... }`.
+
+---
+
 ## Step failure reasons set by AGEM
 
 Besides the normalised agent `error_type` codes above, AGEM itself can end a step with:
