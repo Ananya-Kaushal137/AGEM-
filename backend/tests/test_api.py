@@ -5,6 +5,7 @@ invalid body returns 422 in the same envelope.
 """
 
 import hashlib
+import json
 import re
 import uuid
 
@@ -407,3 +408,127 @@ def test_delete_an_agent_used_by_a_workflow_is_409(api, agent_db, agent_url):
 
     assert_envelope(api.delete(f"/api/agents/{agent_id}"), 409, "AGENT_IN_USE")
     assert api.get(f"/api/agents/{agent_id}").status_code == 200
+
+
+# --- Workflow creation (Prompt 7: FR-WFL-001…009, US-02) ----------------------
+
+
+@pytest.fixture
+def agents(api, agent_url):
+    """Four registered ACTIVE agents, by name."""
+    return {n: _register(api, agent_url, name=n).json()["agent_id"] for n in ("Research", "Finance", "Checker", "Writer")}
+
+
+def _wf(steps, name="Report"):
+    return {"name": name, "steps": steps}
+
+
+def _step(key, agent_id, depends_on=(), **mapping):
+    return {"key": key, "agent_id": agent_id, "depends_on": list(depends_on),
+            "input_mapping": {t: {"from": f, "field": fld, "type": ty} for t, (f, fld, ty) in mapping.items()}}
+
+
+def test_create_a_linear_workflow_stores_a_fixed_order(api, agents):
+    body = _wf([
+        _step("writer", agents["Writer"], ["finance"], report_input=("finance", "profit", "number")),
+        _step("research", agents["Research"], company=("input", "company", "string")),
+        _step("finance", agents["Finance"], ["research"], revenue=("research", "revenue", "number")),
+    ])
+    resp = api.post("/api/workflows", json=body)
+    assert resp.status_code == 201
+    wf = resp.json()
+    assert wf["status"] == "ACTIVE" and wf["step_count"] == 3
+    assert [(s["key"], s["step_order"]) for s in wf["steps"]] == [("research", 1), ("finance", 2), ("writer", 3)]
+
+    ids = {s["key"]: s["workflow_agent_id"] for s in wf["steps"]}
+    steps = {s["key"]: s for s in wf["steps"]}
+    assert steps["finance"]["depends_on"] == [ids["research"]]
+    assert steps["finance"]["input_mapping"] == {"revenue": {"from": ids["research"], "field": "revenue", "type": "number"}}
+    assert steps["research"]["input_mapping"]["company"]["from"] == "input"
+
+    assert api.get(f"/api/workflows/{wf['workflow_id']}").json()["steps"] == wf["steps"]
+    assert [w["workflow_id"] for w in api.get("/api/workflows").json()] == [wf["workflow_id"]]
+
+
+def test_detail_returns_a_react_flow_graph(api, agents):
+    wf = api.post("/api/workflows", json=_wf([
+        _step("research", agents["Research"]),
+        _step("finance", agents["Finance"], ["research"]),
+        _step("checker", agents["Checker"], ["research"]),
+        _step("writer", agents["Writer"], ["finance", "checker"]),
+    ])).json()
+    ids = {s["key"]: s["workflow_agent_id"] for s in wf["steps"]}
+    nodes = {n["id"]: n for n in wf["graph"]["nodes"]}
+    assert set(nodes) == set(ids.values())
+    assert nodes[ids["research"]]["data"]["label"] == "Research"
+    assert {(e["source"], e["target"]) for e in wf["graph"]["edges"]} == {
+        (ids["research"], ids["finance"]), (ids["research"], ids["checker"]),
+        (ids["finance"], ids["writer"]), (ids["checker"], ids["writer"]),
+    }
+    # Siblings share a column; each later level is further right.
+    x = {k: nodes[i]["position"]["x"] for k, i in ids.items()}
+    assert x["research"] < x["finance"] == x["checker"] < x["writer"]
+    # A diamond still gets one fixed order, with the root first and the join last.
+    order = {s["key"]: s["step_order"] for s in wf["steps"]}
+    assert order["research"] == 1 and order["writer"] == 4
+
+
+@pytest.mark.parametrize("deps", [
+    {"a": ["b"], "b": ["a"]},
+    {"a": ["c"], "b": ["a"], "c": ["b"]},
+    {"a": ["a"]},
+])
+def test_a_cycle_is_rejected_before_saving(api, agent_db, agents, deps):
+    steps = [_step(k, agents["Research"], d) for k, d in deps.items()]
+    assert_envelope(api.post("/api/workflows", json=_wf(steps)), 400, "WORKFLOW_CYCLE_DETECTED")
+    assert agent_db.scalar(select(func.count()).select_from(Workflow)) == 0
+
+
+def test_an_unknown_agent_is_rejected_at_creation(api, agent_db, agents):
+    resp = api.post("/api/workflows", json=_wf([_step("a", agents["Research"]), _step("b", str(uuid.uuid4()), ["a"])]))
+    assert_envelope(resp, 404, "AGENT_NOT_FOUND")
+    assert agent_db.scalar(select(func.count()).select_from(Workflow)) == 0
+
+
+def test_an_inactive_agent_is_rejected(api, agent_db, agents):
+    from app.models.enums import AgentStatus
+    agent_db.get(Agent, uuid.UUID(agents["Writer"])).status = AgentStatus.INACTIVE
+    agent_db.commit()
+    assert_envelope(api.post("/api/workflows", json=_wf([_step("w", agents["Writer"])])), 422, "VALIDATION_ERROR")
+
+
+@pytest.mark.parametrize("steps", [
+    [],                                                              # 0 steps
+    [{"k": i} for i in range(6)],                                    # 6 steps
+], ids=["zero", "six"])
+def test_workflow_size_is_one_to_five(api, agents, steps):
+    body = _wf([_step(f"s{i}", agents["Research"]) for i, _ in enumerate(steps)])
+    assert_envelope(api.post("/api/workflows", json=body), 422, "VALIDATION_ERROR")
+
+
+def test_five_steps_are_accepted(api, agents):
+    keys = ["a", "b", "c", "d", "e"]
+    steps = [_step(k, agents["Research"], keys[:i][-1:]) for i, k in enumerate(keys)]
+    assert api.post("/api/workflows", json=_wf(steps)).status_code == 201
+
+
+@pytest.mark.parametrize("steps", [
+    [_step("a", "{R}"), _step("a", "{R}")],                                     # duplicate key
+    [_step("a", "{R}", ["ghost"])],                                             # unknown dependency
+    [_step("a", "{R}"), _step("b", "{R}", x=("a", "f", "number"))],             # mapping from a non-dependency
+    [_step("input", "{R}")],                                                    # reserved key
+    [_step("a", "{R}"), _step("b", "{R}", ["a", "a"])],                         # duplicate dependency
+    [{**_step("a", "{R}"), "input_mapping": {"x": {"from": "input", "field": "f", "type": "float"}}}],  # bad type
+])
+def test_invalid_step_definitions_are_422(api, agents, steps):
+    body = json.loads(json.dumps(_wf(steps)).replace("{R}", agents["Research"]))
+    assert_envelope(api.post("/api/workflows", json=body), 422, "VALIDATION_ERROR")
+
+
+def test_unknown_workflow_is_404(api):
+    assert_envelope(api.get(f"/api/workflows/{uuid.uuid4()}"), 404, "WORKFLOW_NOT_FOUND")
+
+
+def test_an_agent_in_a_workflow_cannot_be_deleted(api, agents):
+    api.post("/api/workflows", json=_wf([_step("f", agents["Finance"])]))
+    assert_envelope(api.delete(f"/api/agents/{agents['Finance']}"), 409, "AGENT_IN_USE")

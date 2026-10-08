@@ -1,1 +1,0 @@
-"""Adapter for CrewAI agents."""

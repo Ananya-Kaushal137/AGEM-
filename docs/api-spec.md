@@ -87,6 +87,30 @@ There is **no** Web Research Agent endpoint. Web search runs inside the backend 
 
 ---
 
+## Creating a workflow (`POST /api/workflows`)
+
+Steps are named by a short `key` you choose; AGEM turns keys into `workflow_agent_id`s when it saves. Steps may be listed in any order — AGEM works out the run order once and stores it as `step_order` (FR-WFL-004).
+
+```json
+{
+  "name": "Investment report",
+  "steps": [
+    { "key": "research", "agent_id": "<uuid>", "depends_on": [],
+      "input_mapping": { "company": { "from": "input", "field": "company", "type": "string" } } },
+    { "key": "finance", "agent_id": "<uuid>", "depends_on": ["research"],
+      "input_mapping": { "revenue": { "from": "research", "field": "revenue", "type": "number" } } }
+  ]
+}
+```
+
+- 1–5 steps (FR-WFL-009); keys unique; `"input"` is reserved.
+- `input_mapping`: *target input field* → `{from, field, type}`. `from` is a step in this step's `depends_on`, or `"input"` (the execution's starting input). `type` is one of `string, number, integer, boolean, object, array, any` (default `any`) and is what the output drift check verifies (FR-CAP-026).
+- Stored form: `depends_on` and `from` hold `workflow_agent_id`s instead of keys.
+- Errors: a loop (including a step depending on itself) → `400 WORKFLOW_CYCLE_DETECTED`; an unregistered `agent_id` → `404 AGENT_NOT_FOUND`; an `INACTIVE` agent or a malformed step → `422 VALIDATION_ERROR`. Nothing is saved on any error; a saved workflow is `ACTIVE`.
+- `GET /api/workflows/{id}` returns `steps` plus `graph: {nodes, edges}` in the shape React Flow takes directly (`id`, `position`, `data`; `id`, `source`, `target`).
+
+---
+
 ## Step failure reasons set by AGEM
 
 Besides the normalised agent `error_type` codes above, AGEM itself can end a step with:
