@@ -606,8 +606,8 @@ def test_a_two_agent_workflow_runs_end_to_end(api, agent_db, demo):
     assert execution.task == "Investment report" and execution.input == {"company": "Tesla"}
 
 
-def test_a_missing_tool_ends_the_step_failed_for_now(api, agent_db, demo):
-    """Until Prompt 11 adds pause and diagnosis, the normalised error is stored and the run stops."""
+def test_a_missing_tool_pauses_the_step(api, agent_db, demo):
+    """Prompt 9: the step pauses with the normalised error; diagnosis arrives in Prompt 11."""
     wf = api.post("/api/workflows", json=_wf([
         _step("research", demo["Research"], company=("input", "company", "string")),
         _step("finance", demo["Finance"], ["research"], revenue=("research", "revenue", "number")),
@@ -616,7 +616,8 @@ def test_a_missing_tool_ends_the_step_failed_for_now(api, agent_db, demo):
                             json={"task": "t", "input": {"company": "Tesla"}}).json()["execution_id"]
 
     execution = _execution(agent_db, execution_id)
-    assert execution.status.value == "FAILED"
+    assert execution.status.value == "PAUSED"
+    assert [s.status.value for s in execution.steps] == ["SUCCEEDED", "PAUSED"]
     assert execution.steps[1].error == {"status": "FAILED", "error_type": "MISSING_CAPABILITY",
                                         "raw_error": "MISSING_CAPABILITY", "capability": "calculate_compound_interest"}
 

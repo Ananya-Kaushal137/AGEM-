@@ -105,7 +105,7 @@ class StepExecutor:
         self._session = session_factory
         self._make_adapter = make_adapter
 
-    async def run_step(self, step_id: UUID) -> dict:
+    async def run_step(self, step_id: UUID, context: dict | None = None) -> dict:
         """Call the step's agent once with the input already stored on the step; return the normalised result.
 
         Never raises for anything the agent or adapter does. Raises `LookupError`
@@ -115,7 +115,7 @@ class StepExecutor:
             step = db.get(ExecutionStep, step_id)
             if step is None:
                 raise LookupError(f"ExecutionStep {step_id} does not exist.")
-            request = {"task": step.execution.task, "input": step.input or {}, "context": {}}
+            request = {"task": step.execution.task, "input": step.input or {}, "context": context or {}}
             agent = step.agent
             log = {"execution_id": str(step.execution_id), "step_id": str(step_id), "agent_id": str(agent.agent_id)}
             try:

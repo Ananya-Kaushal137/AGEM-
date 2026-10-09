@@ -365,7 +365,8 @@ from app.models.enums import AgentFramework, ExecutionStatus, RecoveryStage, Wor
 from app.schemas.execution import ExecutionCreate  # noqa: E402
 from orchestrator import orchestrator as orchestrator_module  # noqa: E402
 from orchestrator import step_executor  # noqa: E402
-from orchestrator.orchestrator import IllegalTransition, Orchestrator, rollup  # noqa: E402
+from orchestrator.checkpoint_manager import CheckpointManager  # noqa: E402
+from orchestrator.orchestrator import MAX_ATTEMPTS, IllegalTransition, Orchestrator, rollup  # noqa: E402
 from orchestrator.step_executor import StepExecutor, normalise_exception, normalise_reply  # noqa: E402
 
 
@@ -621,8 +622,8 @@ def test_several_end_steps_give_a_keyed_final_output(h):
     assert execution.final_output == {"b": {"y": 2}, "c": {"z": 3}}
 
 
-def test_a_failed_step_stops_the_run_with_the_normalised_error(h):
-    """No recovery yet (Prompt 11): the step ends FAILED, downstream stays PENDING, the run is FAILED."""
+def test_a_failed_step_pauses_with_the_normalised_error(h):
+    """Prompt 9 (FR-CKP-004): only the failed step pauses, downstream stays PENDING, the run is PAUSED."""
     research = h.agent("Research", ok(revenue=1))
     finance = h.agent("Finance", lambda i: {"status": "FAILED", "error": "MISSING_CAPABILITY",
                                             "capability": "calculate_compound_interest"})
@@ -631,11 +632,10 @@ def test_a_failed_step_stops_the_run_with_the_normalised_error(h):
                      ("writer", writer, ["finance"], {})])
     execution = h.load(h.run(wf))
 
-    assert [s.status for s in execution.steps] == [StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.PENDING]
+    assert [s.status for s in execution.steps] == [StepStatus.SUCCEEDED, StepStatus.PAUSED, StepStatus.PENDING]
     assert execution.steps[1].error == {"status": "FAILED", "error_type": "MISSING_CAPABILITY",
                                         "raw_error": "MISSING_CAPABILITY", "capability": "calculate_compound_interest"}
-    assert execution.status == ExecutionStatus.FAILED and execution.finished_at
-    assert "finance" in execution.error_summary and "MISSING_CAPABILITY" in execution.error_summary
+    assert execution.status == ExecutionStatus.PAUSED and execution.finished_at is None
     assert execution.final_output is None
     assert h.order() == ["Research", "Finance"]
 
@@ -646,7 +646,7 @@ def test_an_adapter_exception_is_normalised_too(h):
 
     execution = h.load(h.run(h.workflow([("a", h.agent("A", boom), [], {})])))
     assert execution.steps[0].error["error_type"] == "CONNECTION_ERROR"
-    assert execution.status == ExecutionStatus.FAILED
+    assert execution.status == ExecutionStatus.PAUSED
 
 
 def test_a_failed_sibling_lets_the_other_finish(h):
@@ -656,7 +656,7 @@ def test_a_failed_sibling_lets_the_other_finish(h):
     end = h.agent("End", ok(z=3))
     execution = h.load(h.run(h.workflow([("root", root, [], {}), ("bad", bad, ["root"], {}),
                                          ("good", good, ["root"], {}), ("end", end, ["bad", "good"], {})])))
-    assert [s.status for s in execution.steps] == [StepStatus.SUCCEEDED, StepStatus.FAILED,
+    assert [s.status for s in execution.steps] == [StepStatus.SUCCEEDED, StepStatus.PAUSED,
                                                    StepStatus.SUCCEEDED, StepStatus.PENDING]
 
 
@@ -664,7 +664,7 @@ def test_a_missing_upstream_field_fails_before_calling_the_agent(h):
     a, b = h.agent("A", ok(revenue=1)), h.agent("B", ok(done=True))
     execution = h.load(h.run(h.workflow([("a", a, [], {}), ("b", b, ["a"], {"profit": ("a", "profit")})])))
     step = execution.steps[1]
-    assert step.status == StepStatus.FAILED and step.error["error_type"] == "AGENT_ERROR"
+    assert step.status == StepStatus.PAUSED and step.error["error_type"] == "AGENT_ERROR"
     assert '"profit"' in step.error["raw_error"]
     assert h.order() == ["A"]
 
@@ -700,9 +700,9 @@ def test_a_failed_commit_leaves_no_half_written_success(h, monkeypatch):
 def test_input_is_read_from_the_checkpoint(h, monkeypatch):
     """FR-ORC-005: the upstream value comes from its checkpoint, not from the step row."""
     a, b = h.agent("A", ok(revenue=5)), h.agent("B", ok(done=True))
-    original = orchestrator_module._checkpointed_output
-    monkeypatch.setattr(orchestrator_module, "_checkpointed_output",
-                        lambda db, sid: {**original(db, sid), "revenue": "from-checkpoint"})
+    original = CheckpointManager.output_of
+    monkeypatch.setattr(CheckpointManager, "output_of",
+                        lambda self, sid: {**original(self, sid), "revenue": "from-checkpoint"})
     execution = h.load(h.run(h.workflow([("a", a, [], {}), ("b", b, ["a"], {"revenue": ("a", "revenue")})])))
     assert execution.steps[1].input == {"revenue": "from-checkpoint"}
 
@@ -736,7 +736,7 @@ def test_a_framework_without_an_adapter_is_a_normalised_failure(h):
     execution_id = h.start(h.workflow([("a", a, [], {})]))
     asyncio.run(Orchestrator(h.sessions).run_execution(execution_id))  # the real adapter_for
     step = h.load(execution_id).steps[0]
-    assert step.status == StepStatus.FAILED and step.error["error_type"] == "AGENT_ERROR"
+    assert step.status == StepStatus.PAUSED and step.error["error_type"] == "AGENT_ERROR"
     assert "langchain" in step.error["raw_error"]
 
 
@@ -760,3 +760,185 @@ def test_orchestrator_has_no_framework_code():
     """P6: HTTP and framework knowledge stays in adapters/ and step_executor.py."""
     source = Path(orchestrator_module.__file__).read_text(encoding="utf-8")
     assert not re.search(r"^\s*(import|from)\s+(httpx|adapters)\b", source, re.MULTILINE)
+
+
+
+# --- Checkpoints, pause and resume (Prompt 9: FR-CKP-001…008, US-06) ---------
+
+
+class Flaky:
+    """Fails with MISSING_CAPABILITY until `fixed` is set, then succeeds with `output`."""
+
+    def __init__(self, **output):
+        self.fixed, self.output = False, output
+
+    def __call__(self, _input):
+        if self.fixed:
+            return {"status": "SUCCEEDED", "output": self.output}
+        return {"status": "FAILED", "error": "MISSING_CAPABILITY", "capability": "calculate_compound_interest"}
+
+
+def _paused_report(h):
+    """Research → Finance (pauses) → Writer, run once. Returns (execution_id, finance step id, flaky)."""
+    finance = Flaky(projected_value=1628.89)
+    research = h.agent("Research", ok(company="Tesla", revenue=96.77))
+    fin = h.agent("Finance", finance)
+    writer = h.agent("Writer", lambda i: {"status": "SUCCEEDED", "output": {"report": f"{i['company']}: {i['value']}"}})
+    wf = h.workflow([
+        ("research", research, [], {"company": ("input", "company")}),
+        ("finance", fin, ["research"], {"company": ("research", "company"), "revenue": ("research", "revenue")}),
+        ("writer", writer, ["finance"], {"company": ("research", "company"), "value": ("finance", "projected_value")}),
+    ])
+    execution_id = h.run(wf, input={"company": "Tesla"})
+    return execution_id, h.load(execution_id).steps[1].step_id, finance
+
+
+def _resume(h, step_id, tool_results=None):
+    executor = StepExecutor(h.sessions, make_adapter=h.make_adapter)
+    asyncio.run(Orchestrator(h.sessions, executor).resume_step(step_id, tool_results))
+
+
+def _checkpoints(h, execution_id):
+    with h.sessions() as db:
+        steps = db.scalars(select(ExecutionStep).where(ExecutionStep.execution_id == execution_id)
+                           .order_by(ExecutionStep.step_order)).all()
+        return [[c.state for c in sorted(s.checkpoints, key=lambda c: c.created_at)] for s in steps]
+
+
+def test_checkpoint_manager_save_and_load(h):
+    """FR-CKP-001: load returns the newest checkpoint of the execution, {} when there is none."""
+    execution_id, finance_id, _ = _paused_report(h)
+    with h.sessions() as db:
+        state = CheckpointManager(db).load(execution_id)
+        assert state["current_step"] == str(finance_id)  # the pause was the last thing written
+        assert CheckpointManager(db).load(uuid.uuid4()) == {}
+        with pytest.raises(ValueError):
+            CheckpointManager(db).save(finance_id, {"current_step": "x"})  # FR-CKP-003 contents enforced
+
+
+def test_a_checkpoint_is_written_on_success_and_on_pause(h):
+    """FR-CKP-002 / 003: Research has its success checkpoint, Finance its pause checkpoint."""
+    execution_id, finance_id, _ = _paused_report(h)
+    research_cps, finance_cps, writer_cps = _checkpoints(h, execution_id)
+    assert len(research_cps) == 1 and len(finance_cps) == 1 and writer_cps == []
+
+    pause = finance_cps[0]
+    assert set(pause) == {"current_step", "completed_steps", "outputs", "pending_inputs", "workflow_state", "recovery"}
+    assert pause["workflow_state"]["step_status"][str(finance_id)] == "PAUSED"
+    assert pause["workflow_state"]["execution_status"] == "PAUSED"
+    assert pause["pending_inputs"] == {str(finance_id): {"company": "Tesla", "revenue": 96.77}}
+    assert pause["recovery"]["attempts"] == 1
+    assert pause["recovery"]["error"]["error_type"] == "MISSING_CAPABILITY"
+    assert list(pause["outputs"].values()) == [{"company": "Tesla", "revenue": 96.77}]  # Research's, kept
+
+
+def test_only_the_failed_step_pauses(h):
+    """FR-CKP-004: upstream stays SUCCEEDED and untouched, downstream stays PENDING."""
+    execution_id, _, _ = _paused_report(h)
+    execution = h.load(execution_id)
+    assert [s.status for s in execution.steps] == [StepStatus.SUCCEEDED, StepStatus.PAUSED, StepStatus.PENDING]
+    assert execution.status == ExecutionStatus.PAUSED
+    assert execution.steps[0].attempts == 1
+
+
+def test_resume_continues_without_rerunning_upstream(h):
+    """US-06 / FR-CKP-005 / BR-01: the done-when. Research runs once; Finance resumes; Writer then runs."""
+    execution_id, finance_id, finance = _paused_report(h)
+    finance.fixed = True
+    _resume(h, finance_id)
+
+    assert h.order() == ["Research", "Finance", "Finance", "Writer"]  # Research never re-run
+    execution = h.load(execution_id)
+    assert [s.status for s in execution.steps] == [StepStatus.SUCCEEDED] * 3
+    assert execution.status == ExecutionStatus.SUCCEEDED
+    assert execution.steps[1].attempts == 2
+    assert execution.final_output == {"report": "Tesla: 1628.89"}
+    assert [len(c) for c in _checkpoints(h, execution_id)] == [1, 2, 1]  # Finance: pause, then success
+
+
+def test_resume_reads_its_input_from_the_pause_checkpoint(h):
+    """FR-CKP-005: even if the step row changed, the input saved at the pause is what is sent."""
+    execution_id, finance_id, finance = _paused_report(h)
+    with h.sessions() as db:
+        db.get(ExecutionStep, finance_id).input = {"tampered": True}
+        db.commit()
+    finance.fixed = True
+    _resume(h, finance_id)
+    finance_inputs = [i for name, phase, i in h.calls if name == "Finance" and phase == "start"]
+    assert finance_inputs == [{"company": "Tesla", "revenue": 96.77}] * 2
+
+
+def test_resume_sends_tool_results_as_context(h):
+    """What Prompt 14 will use: the verified tool's result reaches the agent in context.tool_results."""
+    requests = []
+    execution_id, finance_id, finance = _paused_report(h)
+    finance.fixed = True
+    real = h.make_adapter
+
+    def recording(agent):
+        adapter = real(agent)
+        original = adapter.execute
+
+        async def execute(request):
+            requests.append((agent.name, request["context"]))
+            return await original(request)
+
+        adapter.execute = execute
+        return adapter
+
+    h.make_adapter = recording
+    _resume(h, finance_id, tool_results={"calculate_compound_interest": 1628.89})
+    assert requests[0] == ("Finance", {"tool_results": {"calculate_compound_interest": 1628.89}})
+    assert requests[1] == ("Writer", {})  # only the resumed step gets the tool result
+
+
+def test_resuming_a_succeeded_step_is_a_no_op(h):
+    """FR-CKP-006."""
+    execution_id, finance_id, finance = _paused_report(h)
+    finance.fixed = True
+    _resume(h, finance_id)
+    calls = len(h.calls)
+    _resume(h, finance_id)
+    _resume(h, h.load(execution_id).steps[0].step_id)
+    assert len(h.calls) == calls
+
+
+def test_two_resumes_at_once_run_the_step_once(h):
+    """FR-CKP-006: a double-click or a retried background task can't duplicate work."""
+    _, finance_id, finance = _paused_report(h)
+    finance.fixed = True
+    executor = StepExecutor(h.sessions, make_adapter=h.make_adapter)
+    orchestrator = Orchestrator(h.sessions, executor)
+
+    async def both():
+        await asyncio.gather(orchestrator.resume_step(finance_id), orchestrator.resume_step(finance_id))
+
+    asyncio.run(both())
+    assert h.order().count("Finance") == 2  # the first run, plus exactly one resume
+
+
+def test_after_three_failed_attempts_the_step_is_failed(h):
+    """FR-CKP-008: a PAUSED step does not pause forever."""
+    assert MAX_ATTEMPTS == 3
+    execution_id, finance_id, _ = _paused_report(h)  # attempt 1 fails
+    _resume(h, finance_id)                            # attempt 2 fails
+    assert h.load(execution_id).steps[1].status == StepStatus.PAUSED
+    _resume(h, finance_id)                            # attempt 3 fails → FAILED
+
+    execution = h.load(execution_id)
+    step = execution.steps[1]
+    assert step.status == StepStatus.FAILED and step.attempts == 3 and step.finished_at
+    assert execution.status == ExecutionStatus.FAILED and "MISSING_CAPABILITY" in execution.error_summary
+    assert len(_checkpoints(h, execution_id)[1]) == 3  # every failed attempt left its pause checkpoint
+    _resume(h, finance_id)                            # a FAILED step is not resumed
+    assert h.order().count("Finance") == 3 and h.order().count("Research") == 1
+
+
+def test_there_is_no_public_resume_endpoint():
+    """FR-CKP-007 / BR-07 / P9: resume is internal only."""
+    from fastapi.routing import APIRoute
+
+    from main import create_app
+
+    paths = [r.path for r in create_app().routes if isinstance(r, APIRoute)]
+    assert not [p for p in paths if "resume" in p.lower()]

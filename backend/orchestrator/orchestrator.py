@@ -13,9 +13,13 @@ together with the execution roll-up and, on success, the checkpoint — one
 transaction per transition (FR-ORC-013, P3). The database is the only state:
 nothing about a run lives only in memory.
 
-Not here yet (Roadmap Week 4 is "no failure yet"): pause, diagnosis, retry and
-recovery. A failed step simply ends FAILED and the run stops — Prompt 11 replaces
-that with PAUSED → `master_agent.diagnose_failure`.
+Pause and resume (Prompt 9, FR-CKP-002…008): a failed step is PAUSED with a
+pause checkpoint; only that step, upstream steps are untouched. Independent
+siblings keep running. `resume_step` re-runs exactly that step from its pause
+checkpoint and then carries on. After MAX_ATTEMPTS failed attempts the step is
+FAILED instead. There is no public resume endpoint (FR-CKP-007, BR-07):
+`resume_step` is only called by AGEM itself, after a diagnosis (Prompt 11) or a
+verified capability (Prompt 14).
 """
 
 import asyncio
@@ -30,13 +34,17 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.database import SessionLocal
-from app.models import Checkpoint, Execution, ExecutionStep, utcnow
+from app.models import Execution, ExecutionStep, utcnow
 from app.models.enums import ErrorType, ExecutionStatus, StepStatus, can_transition
 from app.schemas.workflow import INPUT_SOURCE
 
+from .checkpoint_manager import CheckpointManager, build_state
 from .step_executor import SUCCEEDED, StepExecutor, failure
 
-__all__ = ["Orchestrator", "IllegalTransition", "rollup"]
+__all__ = ["Orchestrator", "IllegalTransition", "rollup", "MAX_ATTEMPTS"]
+
+# FR-CKP-008: after this many failed attempts a PAUSED step becomes FAILED.
+MAX_ATTEMPTS = 3
 
 logger = logging.getLogger("agem.orchestrator")
 
@@ -85,10 +93,48 @@ class Orchestrator:
             plan = self._plan(execution_id)
             if plan is None:
                 return
-            while ready := self._ready_steps(execution_id, plan):
-                await asyncio.gather(*(self._run_one(plan, step_id) for step_id in ready))
+            await self._drive(execution_id, plan)
         except Exception:  # noqa: BLE001 — a background task has no caller to raise to
             logger.exception("orchestrator crashed", extra={"agem": {"execution_id": str(execution_id)}})
+
+    async def resume_step(self, step_id: UUID, tool_results: dict | None = None) -> None:
+        """Re-run exactly one PAUSED step from its pause checkpoint, then carry on with the run.
+
+        Internal only (FR-CKP-007): called after a diagnosis or a verified capability,
+        never by a user. `tool_results` reaches the agent as `context.tool_results`.
+        A step that is not PAUSED (already SUCCEEDED, or being resumed right now) is
+        left alone, so a repeated call can't duplicate work (FR-CKP-006). Never raises.
+        """
+        try:
+            started = time.perf_counter()
+            with self._session() as db:
+                step = db.get(ExecutionStep, step_id)
+                if step is None or step.status != StepStatus.PAUSED:
+                    logger.info("resume skipped", extra={"agem": {
+                        "step_id": str(step_id), "status": step.status.value if step else None}})
+                    return
+                plan = _plan_for(step.execution)
+                if step.attempts >= MAX_ATTEMPTS:
+                    _move(step, StepStatus.FAILED, plan, finished_at=utcnow())
+                    db.commit()
+                    return
+                # FR-CKP-005: the input saved at the pause, not rebuilt from upstream steps.
+                step_input = CheckpointManager(db).paused_input(step_id)
+                if step_input is None:
+                    step_input = step.input or {}
+                _move(step, StepStatus.RUNNING, plan, input=step_input, attempts=step.attempts + 1)
+                db.commit()
+                execution_id = step.execution_id
+            context = {"tool_results": tool_results} if tool_results else {}
+            result = await self._executor.run_step(step_id, context=context)
+            self._finish(plan, step_id, result, time.perf_counter() - started)
+            await self._drive(execution_id, plan)
+        except Exception:  # noqa: BLE001 — called from background work, nobody to raise to
+            logger.exception("resume crashed", extra={"agem": {"step_id": str(step_id)}})
+
+    async def _drive(self, execution_id: UUID, plan: "Plan") -> None:
+        while ready := self._ready_steps(execution_id, plan):
+            await asyncio.gather(*(self._run_one(plan, step_id) for step_id in ready))
 
     # --- reading -----------------------------------------------------------
 
@@ -104,7 +150,11 @@ class Orchestrator:
             return _plan_for(execution)
 
     def _ready_steps(self, execution_id: UUID, plan: Plan) -> list[UUID]:
-        """FR-ORC-003: PENDING, and every step in depends_on SUCCEEDED. Stops once any step has FAILED."""
+        """FR-ORC-003: PENDING, and every step in depends_on SUCCEEDED. Stops once any step has FAILED.
+
+        A PAUSED step does not stop the run: its dependants simply never become
+        READY, while independent siblings carry on (Architecture §11.2).
+        """
         with self._session() as db:
             status = dict(db.execute(
                 select(ExecutionStep.step_id, ExecutionStep.status).where(ExecutionStep.execution_id == execution_id)
@@ -135,15 +185,27 @@ class Orchestrator:
             result = failure(ErrorType.AGENT_ERROR, "input_mapping cannot be satisfied: " + "; ".join(missing))
         else:
             result = await self._executor.run_step(step_id)
+        self._finish(plan, step_id, result, bookkeeping)
 
+    def _finish(self, plan: "Plan", step_id: UUID, result: dict, bookkeeping: float) -> None:
+        """Record one attempt: SUCCEEDED + success checkpoint, or PAUSED + pause checkpoint.
+
+        A failure on the last allowed attempt still writes the pause checkpoint, then
+        moves PAUSED → FAILED (FR-CKP-008), so the failed input stays inspectable.
+        """
         started = time.perf_counter()
         with self._session() as db:
             step = db.get(ExecutionStep, step_id)
+            checkpoints = CheckpointManager(db)
             if result["status"] == SUCCEEDED:
                 _move(step, StepStatus.SUCCEEDED, plan, output=result["output"], finished_at=utcnow())
-                db.add(Checkpoint(step_id=step_id, state=_checkpoint_state(step, plan)))
+                checkpoints.save(step_id, _checkpoint_state(step, plan))
             else:
-                _move(step, StepStatus.FAILED, plan, error=result, finished_at=utcnow())
+                # FR-CKP-004: only this step pauses; upstream steps are not touched.
+                _move(step, StepStatus.PAUSED, plan, error=result)
+                checkpoints.save(step_id, _checkpoint_state(step, plan, error=result))
+                if step.attempts >= MAX_ATTEMPTS:
+                    _move(step, StepStatus.FAILED, plan, finished_at=utcnow())
             db.commit()  # status, output, roll-up and checkpoint together (FR-ORC-013)
             bookkeeping += time.perf_counter() - started
             logger.info("step finished", extra={"agem": {
@@ -190,20 +252,13 @@ def _build_input(db: Session, step: ExecutionStep, plan: Plan) -> tuple[dict[str
         else:
             upstream = src["from"]
             if upstream not in outputs:
-                outputs[upstream] = _checkpointed_output(db, upstream)
+                outputs[upstream] = CheckpointManager(db).output_of(upstream)
             source, where = outputs[upstream], f'the output of step "{plan.keys[upstream]}"'
         if src["field"] in source:
             step_input[target] = source[src["field"]]
         else:
             missing.append(f'"{target}" needs field "{src["field"]}", which is not in {where}')
     return step_input, missing
-
-
-def _checkpointed_output(db: Session, step_id: UUID) -> dict:
-    checkpoint = db.scalars(
-        select(Checkpoint).where(Checkpoint.step_id == step_id).order_by(Checkpoint.created_at.desc()).limit(1)
-    ).first()
-    return (checkpoint.state.get("outputs", {}).get(str(step_id)) or {}) if checkpoint else {}
 
 
 def _move(step: ExecutionStep, new: StepStatus, plan: Plan, **fields: Any) -> None:
@@ -233,24 +288,5 @@ def _move(step: ExecutionStep, new: StepStatus, plan: Plan, **fields: Any) -> No
                                    f'{error.get("error_type")}: {str(error.get("raw_error", ""))[:300]}')
 
 
-def _checkpoint_state(step: ExecutionStep, plan: Plan) -> dict:
-    """The success checkpoint, holding the five things Architecture §11.3 lists.
-
-    Prompt 9 moves the writing of this into CheckpointManager.save and adds the pause checkpoint.
-    """
-    steps = step.execution.steps
-    return {
-        "current_step": str(step.step_id),
-        "completed_steps": [str(s.step_id) for s in steps if s.status == StepStatus.SUCCEEDED],
-        "outputs": {str(s.step_id): s.output for s in steps if s.status == StepStatus.SUCCEEDED},
-        "pending_inputs": {str(s.step_id): s.input for s in steps
-                           if s.status in (StepStatus.RUNNING, StepStatus.PAUSED)},
-        "workflow_state": {
-            "execution_id": str(step.execution_id),
-            "workflow_id": str(step.execution.workflow_id),
-            "execution_status": step.execution.status.value,
-            "step_status": {str(s.step_id): s.status.value for s in steps},
-            "step_keys": {str(s): k for s, k in plan.keys.items()},
-        },
-        "recovery": {"recovery_stage": step.recovery_stage.value, "attempts": step.attempts},
-    }
+def _checkpoint_state(step: ExecutionStep, plan: Plan, error: dict | None = None) -> dict:
+    return build_state(step, plan.keys, error)
